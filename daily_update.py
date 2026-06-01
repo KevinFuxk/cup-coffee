@@ -87,10 +87,9 @@ def main():
         print("No new trades; factor scores unchanged. Done.")
         return
 
-    # 2) re-score on the SAME fixed ruler (rebuild so today's trades are included)
-    if os.path.exists(mine_factors.TABLE_PATH):
-        os.remove(mine_factors.TABLE_PATH)
-    mine_factors.main(rebuild=True)
+    # 2) re-score on the SAME fixed ruler (INCREMENTAL: only the new day's trades
+    #    get features computed; the rest are reused from mined_table.json)
+    mine_factors.main(rebuild=False)
 
     # 3) append a compact dated entry to the factor track record
     scores = json.load(open(mine_factors.SCORES_PATH))

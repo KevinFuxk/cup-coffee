@@ -65,24 +65,39 @@ def benjamini_hochberg(pairs, alpha=0.10):
     return sig
 
 
-# ---- assemble the table (features + full-path labels), cached ----
+# ---- assemble the table (features + full-path labels), INCREMENTAL ----
+def _ev_key(ev) -> str:
+    return f"{ev['symbol']}|{ev['day']}|{ev['timeframe']}|{ev.get('breakout_idx')}|{ev.get('handle_num')}"
+
 def build_table(rd, lib, events, rebuild=False):
+    """Reuse already-computed rows (matched by key); compute features only for NEW
+    trades. So a daily run fetches data for just the new day, not the whole history.
+    rebuild=True recomputes everything from scratch."""
+    existing = {}
     if os.path.exists(TABLE_PATH) and not rebuild:
-        return json.load(open(TABLE_PATH))
-    rows = []
-    for i, ev in enumerate(events):
+        for r in json.load(open(TABLE_PATH)):
+            if "key" in r:
+                existing[r["key"]] = r
+    rows, n_new = [], 0
+    for ev in events:
+        k = _ev_key(ev)
+        if k in existing:
+            rows.append(existing[k])
+            continue
         b = rd.bars(ev["symbol"], Date.fromisoformat(ev["day"]), ev["timeframe"])
         if b is None:
             continue
         lab = label_full_path(b, min(ev["breakout_idx"], len(b)-1),
                               ev["entry_price"], ev["stop_price"], ev["risk_R"])
-        feats = lib.compute(ev)
-        rows.append({"symbol": ev["symbol"], "day": ev["day"], "tier": ev.get("size_tier"),
+        rows.append({"key": k, "symbol": ev["symbol"], "day": ev["day"], "tier": ev.get("size_tier"),
                      "realized_R": lab["realized_R"], "win": lab["win"],
-                     "full_mfe_R": lab["full_mfe_R"], "factors": feats})
-        if (i+1) % 50 == 0:
-            print(f"  ...assembled {i+1}/{len(events)} (fetching+caching)")
+                     "full_mfe_R": lab["full_mfe_R"], "factors": lib.compute(ev)})
+        n_new += 1
+        if n_new % 50 == 0:
+            print(f"  ...computed {n_new} new trades (fetching)")
     json.dump(rows, open(TABLE_PATH, "w"))
+    if n_new:
+        print(f"  features: {n_new} new trades computed, {len(rows) - n_new} reused")
     return rows
 
 
