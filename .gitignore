@@ -5,10 +5,12 @@ cache/
 .DS_Store
 __pycache__/
 *.pyc
-# local-only backups / snapshots
-events_2y.jsonl
-mined_table_2y.json
-factor_scores_2y.json
+# regenerable data state (rebuilt from code + APIs; not source) and local backups
+events*.jsonl
+mined_table*.json
+factor_scores*.json
+factor_track*.jsonl
+*.checkpoint
 # never commit secrets
 .env
 *.key

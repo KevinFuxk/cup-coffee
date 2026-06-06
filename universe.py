@@ -158,21 +158,26 @@ class DailyUniverseBuilder:
         stage = [s for s in stage if s.avg_dollar_volume >= scan["min_dollar_volume"]]
         funnel["liquidity_ok"] = len(stage)
 
-        # size-relative catalyst test
+        # catalyst test: per-size-tier momentum gap (usual cases) OR a flat
+        # earnings-gapper rule (reported earnings + revenue growth >= 40% + gap >= 10%),
+        # added as an extra net so important earnings names are never missed.
+        earn = self.cfg.get("earnings_catalyst", {"rev_min": 0.40, "gap_min": 0.10})
         passed: list[tuple[SecuritySnapshot, str, str]] = []   # (snap, tier, reason)
         for s in stage:
             if s.gap_pct is None:
                 continue
             tier = classify_size(s.market_cap)
-            th = by_size.get(tier, by_size["small"])           # fallback to strictest sane tier
-            if self.provider.had_earnings(s.symbol, as_of):
-                rg = s.revenue_growth_yoy
-                if (rg is not None and rg >= th["earnings"]["rev_min"]
-                        and s.gap_pct >= th["earnings"]["gap_min"]):
-                    passed.append((s, tier, "earnings_gap"))
-            else:
-                if s.gap_pct >= th["non_earnings"]["gap_min"]:
-                    passed.append((s, tier, "momentum_gap"))
+            th = by_size.get(tier, by_size["small"])
+            reason = None
+            if s.gap_pct >= th["non_earnings"]["gap_min"]:
+                reason = "momentum_gap"
+            elif (self.provider.had_earnings(s.symbol, as_of)
+                  and s.revenue_growth_yoy is not None
+                  and s.revenue_growth_yoy >= earn["rev_min"]
+                  and s.gap_pct >= earn["gap_min"]):
+                reason = "earnings_gap"
+            if reason:
+                passed.append((s, tier, reason))
         funnel["catalyst_pass"] = len(passed)
 
         # energy-beta tag + trading gate; attach all three category tags
