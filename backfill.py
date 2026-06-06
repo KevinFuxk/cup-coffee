@@ -59,6 +59,7 @@ def _event_record(e, cand, timeframe: str) -> dict:
     rec["size_tier"] = cand.size_tier            # carry Stage-1 tags onto the event
     rec["return_bucket"] = cand.return_bucket
     rec["earnings_bucket"] = cand.earnings_bucket
+    rec["reason"] = cand.reason                   # momentum_gap | earnings_gap | whitelist
     return rec
 
 
@@ -84,18 +85,30 @@ def run_backfill(config, uni_provider, bar_provider, start: Date, end: Date,
             try:
                 wl = builder.build(day)
                 day_events = 0
+                _RANK = {"1min": 0, "2min": 1, "5min": 2}
                 for cand in wl.tradable():
                     series = layer.load(cand.symbol, day)
                     if series is None:
                         continue
+                    # collect detections across timeframes, with entry time + tf priority
+                    found = []   # (entry_dt, rank, tf, event)
                     for tf, bars in series.bars.items():
                         for e in detector.detect(bars, cand.symbol, day):
-                            fout.write(json.dumps(_event_record(e, cand, tf)) + "\n")
-                            day_events += 1
-                            totals["events"] += 1
-                            totals["wins"]     += (e.outcome == 1)
-                            totals["losses"]   += (e.outcome == -1)
-                            totals["timeouts"] += (e.outcome == 0)
+                            found.append((bars.ts[e.breakout_idx], _RANK.get(tf, 9), tf, e))
+                    # cross-timeframe dedup: keep 1min>2min>5min; drop any whose entry is
+                    # within 5 minutes of an already-kept trade (the same setup on another TF)
+                    kept = []
+                    for entry_dt, rank, tf, e in sorted(found, key=lambda x: (x[1], x[0])):
+                        if any(abs((entry_dt - k[0]).total_seconds()) <= 300 for k in kept):
+                            continue
+                        kept.append((entry_dt, rank, tf, e))
+                    for entry_dt, rank, tf, e in kept:
+                        fout.write(json.dumps(_event_record(e, cand, tf)) + "\n")
+                        day_events += 1
+                        totals["events"] += 1
+                        totals["wins"]     += (e.outcome == 1)
+                        totals["losses"]   += (e.outcome == -1)
+                        totals["timeouts"] += (e.outcome == 0)
                     if sleep_between:
                         time.sleep(sleep_between)
                 fout.flush()

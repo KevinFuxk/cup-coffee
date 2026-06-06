@@ -1,93 +1,96 @@
 """
-pattern_detector.py — CUP COFFEE Stage 3: Cup-and-Handle Detector + Labeler
-===========================================================================
-Scans a clean intraday series (from Stage 2) for cup-and-handle setups and
-labels each one win / loss / timeout. The labeled events are the training set
-that Stages 4-5 mine for factors.
+pattern_detector.py — CUP COFFEE Stage 3: Cup-and-Handle Detector (v2 spec)
+==========================================================================
+Rebuilt to the user's exact rules:
 
-Cup-Coffee rules encoded here:
-  * cup >= 15 bars, depth in ATR units (auto-scales by name volatility)
-  * LIP ASYMMETRY: |left_lip - right_lip| <= 25% of cup depth, else not a cup
-  * handle >= 4 bars, depth <= 1/4 of cup depth (the 4:1 .. 5:1 ratio)
-  * breakout = close above the lip + a small ATR buffer
-  * MULTIPLE HANDLES: one cup can spawn several handles; after a stop-out a NEW
-    HIGHER lip + fresh qualifying handle is a separate tradeable event
-  * stop = handle low ; target = measured move (cup depth projected up)
-  * triple-barrier label: +1 target first, -1 stop first, 0 timeout
-    (also records MFE / its timing for the exit-timing research)
+CUP
+  * left rim = any closed bar that is a local peak (high >= the bars on either side)
+  * cup length 15..60 bars (left rim -> right rim)
+  * NO ATR depth filter
+  * right rim = a later peak that recovers to within 25% of the cup depth below the
+    left rim:  left_high - 0.25*depth <= right_high <= left_high
+  * RIM-LINE rule: no bar between the rims may poke above the straight line drawn
+    from the left-rim high to the right-rim high (the cup stays clean under it)
+  cup_depth = left_rim_high - lowest low between the rims
 
-Runs as-is: `python pattern_detector.py` loads the Stage 2 synthetic day
-(which contains a cup-and-handle) and prints the detected, labeled events.
+HANDLE  (left rim of the handle = right rim of the cup)
+  * 4..50 bars long
+  * RATCHET: if within 4 bars a bar makes a higher high than the handle's left rim,
+    that bar becomes the new handle left rim and the 4-bar count restarts
+  * depth (handle_rim_high - handle_low) <= 20% of (handle_rim_high - cup_low)
+  * resolves when price comes back up and retouches the handle rim
+
+ENTRY / STOP
+  * entry = handle_rim_high + $0.01, filled on the bar that reaches it
+  * stop  = handle low ;  R = entry - stop
+
+EXIT (for the events.jsonl label; research re-labels full-path)
+  * stop hit / measured-move target hit / else flat at 3:49pm ET (240-bar cap)
+
+Downstream field names are unchanged (breakout_idx = the entry bar) so the factor
+library and miner keep working.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import date as Date, time as dtime
 from typing import Optional
 
 from data_layer import Bars, _SyntheticProvider, DataLayer
-from datetime import date as Date
 
 logger = logging.getLogger("cupcoffee.detector")
 
+EXIT_CUTOFF = dtime(15, 49)     # flat by 3:49pm ET
 
-# ----------------------------------------------------------------------------
-# Output record — one labeled setup
-# ----------------------------------------------------------------------------
 
 @dataclass
 class CupHandleEvent:
     symbol: str
     day: Date
     timeframe: str
-    # cup geometry
     cup_left_idx: int
     cup_bottom_idx: int
     cup_right_idx: int
     cup_depth: float
-    lip_diff_frac: float          # |L-R| / depth  (must be <= 0.25)
-    # handle / trade
-    handle_num: int               # 1, 2, 3 ... within this cup
+    lip_diff_frac: float
+    handle_num: int
     handle_low: float
-    breakout_idx: int
+    breakout_idx: int          # the ENTRY bar (retouch of handle rim + $0.01)
     entry_price: float
     stop_price: float
     target_price: float
     risk_R: float
-    # outcome
-    outcome: int                  # +1 win / -1 loss / 0 timeout
+    outcome: int
     exit_idx: int
     pnl_R: float
-    mfe_R: float                  # max favourable excursion (R)
-    mfe_idx: int                  # when MFE happened (powers exit-timing research)
+    mfe_R: float
+    mfe_idx: int
     mae_R: float
 
 
 # ----------------------------------------------------------------------------
-# Small numeric helpers
+# small helpers
 # ----------------------------------------------------------------------------
 
-def atr(b: Bars) -> float:
-    """Day-level ATR yardstick = mean true range across the session."""
-    trs = []
-    for i in range(1, len(b)):
-        trs.append(max(b.h[i] - b.l[i],
-                       abs(b.h[i] - b.c[i-1]),
-                       abs(b.l[i] - b.c[i-1])))
-    return sum(trs) / max(1, len(trs))
-
-def swing_highs(b: Bars, k: int) -> list[int]:
-    return [i for i in range(k, len(b) - k)
-            if b.h[i] == max(b.h[i-k:i+k+1])]
-
-def swing_lows_window(b: Bars, lo: int, hi: int) -> int:
-    """Index of the lowest low in [lo, hi)."""
-    best, best_i = float("inf"), lo
+def _lowest_low(b: Bars, lo: int, hi: int) -> int:
+    best_i, best = lo, float("inf")
     for i in range(lo, hi):
         if b.l[i] < best:
             best, best_i = b.l[i], i
     return best_i
+
+def _is_peak(b: Bars, i: int) -> bool:
+    if i <= 0 or i >= len(b) - 1:
+        return False
+    return b.h[i] >= b.h[i - 1] and b.h[i] >= b.h[i + 1]
+
+def _last_bar_by_cutoff(b: Bars) -> int:
+    for i in range(len(b) - 1, -1, -1):
+        if b.ts[i].time() <= EXIT_CUTOFF:
+            return i
+    return len(b) - 1
 
 
 # ----------------------------------------------------------------------------
@@ -96,127 +99,135 @@ def swing_lows_window(b: Bars, lo: int, hi: int) -> int:
 
 class PatternDetector:
     def __init__(self, config: dict):
-        self.p = config["pattern"]
-        self.lab = config["labeling"]
+        p = config["pattern"]
+        self.cup_min = p.get("cup_min_bars", 15)
+        self.cup_max = p.get("cup_max_bars", 60)
+        self.rim_recov = p.get("right_rim_recovery_frac", 0.25)
+        self.h_min = p.get("handle_min_bars", 4)
+        self.h_max = p.get("handle_max_bars", 50)
+        self.ratchet = p.get("handle_ratchet_bars", 4)
+        self.h_depth_frac = p.get("handle_max_depth_frac", 0.20)
+        self.entry_off = p.get("entry_offset_dollars", 0.01)
+        self.max_hold = config.get("labeling", {}).get("max_hold_bars", 240)
 
+    # --- public ---
     def detect(self, b: Bars, symbol: str, day: Date) -> list[CupHandleEvent]:
-        a = atr(b)
-        if a <= 0:
+        n = len(b)
+        if n < self.cup_min + self.h_min + 2:
             return []
         events: list[CupHandleEvent] = []
-        used_right = set()
-        for cup in self._find_cups(b, a):
-            if cup["right_idx"] in used_right:
+        taken_entries: set[int] = set()
+        for li in range(1, n - 1):
+            if not _is_peak(b, li):
                 continue
-            used_right.add(cup["right_idx"])
-            events.extend(self._handles_for_cup(b, cup, a, symbol, day))
-        return events
-
-    # --- cup detection ---
-    def _find_cups(self, b: Bars, a: float) -> list[dict]:
-        cups = []
-        highs = swing_highs(b, k=3)
-        depth_lo = self.p["cup_depth_min_atr"] * a
-        depth_hi = self.p["cup_depth_max_atr"] * a
-        lip_cap = self.p.get("lip_diff_max_frac_of_depth", 0.25)
-        for li in highs:
-            left_lip = b.h[li]
-            win_hi = min(len(b), li + self.p["cup_max_bars"])
-            if win_hi - li < self.p["cup_min_bars"]:
+            cup = self._find_cup(b, li)
+            if cup is None:
                 continue
-            bottom_i = swing_lows_window(b, li + 1, win_hi)
-            depth = left_lip - b.l[bottom_i]
-            if not (depth_lo <= depth <= depth_hi):
+            bottom_idx, ri = cup
+            cup_low = b.l[bottom_idx]
+            cup_depth = b.h[li] - cup_low
+            handle = self._find_handle(b, ri, cup_low)
+            if handle is None:
                 continue
-            # right lip: first swing high after bottom that recovered near the lip
-            for ri in highs:
-                if ri <= bottom_i:
-                    continue
-                if ri - li < self.p["cup_min_bars"] or ri - li > self.p["cup_max_bars"]:
-                    continue
-                right_lip = b.h[ri]
-                # recovered at least halfway back up?
-                if right_lip < b.l[bottom_i] + 0.5 * depth:
-                    continue
-                lip_diff_frac = abs(left_lip - right_lip) / depth
-                if lip_diff_frac > lip_cap:        # RULE 1: lip asymmetry cap
-                    continue
-                cups.append({
-                    "left_idx": li, "bottom_idx": bottom_i, "right_idx": ri,
-                    "depth": depth, "lip_diff_frac": lip_diff_frac,
-                    "lip_level": max(left_lip, right_lip),
-                })
-                break
-        return cups
-
-    # --- handles (multiple) for one cup ---
-    def _handles_for_cup(self, b: Bars, cup: dict, a: float,
-                         symbol: str, day: Date) -> list[CupHandleEvent]:
-        out: list[CupHandleEvent] = []
-        resistance = cup["lip_level"]
-        cup_depth = cup["depth"]
-        i = cup["right_idx"]
-        max_handles = self.p.get("max_handles_per_cup", 3)
-        for handle_num in range(1, max_handles + 1):
-            found = self._find_handle(b, i, resistance, cup_depth, a)
-            if found is None:
-                break
-            handle_low, breakout_idx = found
-            entry = b.c[breakout_idx]
+            h_left_idx, handle_low, entry_idx = handle
+            if entry_idx in taken_entries:
+                continue
+            rim = b.h[h_left_idx]
+            entry = rim + self.entry_off
             stop = handle_low
             if entry <= stop:
-                break
+                continue
             R = entry - stop
-            target = entry + cup_depth          # measured move
+            target = entry + cup_depth            # measured move (research re-labels)
             outcome, exit_idx, pnl_R, mfe_R, mfe_idx, mae_R = \
-                self._triple_barrier(b, breakout_idx, entry, stop, target, R)
-            out.append(CupHandleEvent(
+                self._label(b, entry_idx, entry, stop, target, R)
+            events.append(CupHandleEvent(
                 symbol=symbol, day=day, timeframe=b.timeframe,
-                cup_left_idx=cup["left_idx"], cup_bottom_idx=cup["bottom_idx"],
-                cup_right_idx=cup["right_idx"], cup_depth=cup_depth,
-                lip_diff_frac=cup["lip_diff_frac"], handle_num=handle_num,
-                handle_low=handle_low, breakout_idx=breakout_idx,
+                cup_left_idx=li, cup_bottom_idx=bottom_idx, cup_right_idx=ri,
+                cup_depth=cup_depth,
+                lip_diff_frac=abs(b.h[li] - b.h[ri]) / cup_depth if cup_depth else 0.0,
+                handle_num=1, handle_low=handle_low, breakout_idx=entry_idx,
                 entry_price=entry, stop_price=stop, target_price=target, risk_R=R,
                 outcome=outcome, exit_idx=exit_idx, pnl_R=pnl_R,
                 mfe_R=mfe_R, mfe_idx=mfe_idx, mae_R=mae_R,
             ))
-            # RULE 2: next handle needs a NEW HIGHER lip after this attempt resolves
-            nxt = self._next_higher_lip(b, exit_idx, resistance)
-            if nxt is None:
+            taken_entries.add(entry_idx)
+        return events
+
+    # --- cup: left rim li already a peak; find a valid right rim ---
+    def _find_cup(self, b: Bars, li: int):
+        left_high = b.h[li]
+        hi_lim = min(len(b), li + self.cup_max + 1)
+        bottom_low = float("inf")          # running lowest low over the cup interior (li, ri)
+        bottom_idx = li
+        for ri in range(li + 1, hi_lim):
+            j = ri - 1                     # extend interior to include bar ri-1
+            if j >= li + 1 and b.l[j] < bottom_low:
+                bottom_low, bottom_idx = b.l[j], j
+            if ri - li < self.cup_min:
+                continue
+            if not _is_peak(b, ri):
+                continue
+            right_high = b.h[ri]
+            cup_depth = left_high - bottom_low
+            if cup_depth <= 0:
+                continue
+            # right rim recovers to within 25% of cup depth, and does not exceed the left rim
+            if right_high < left_high - self.rim_recov * cup_depth or right_high > left_high:
+                continue
+            # RIM-LINE: nothing between the rims pokes above the line joining them
+            if self._obstructed(b, li, left_high, ri, right_high):
+                continue
+            return bottom_idx, ri
+        return None
+
+    @staticmethod
+    def _obstructed(b: Bars, li: int, left_high: float, ri: int, right_high: float) -> bool:
+        span = ri - li
+        slope = (right_high - left_high) / span
+        for k in range(li + 1, ri):
+            line = left_high + slope * (k - li)
+            if b.h[k] > line + 1e-9:
+                return True
+        return False
+
+    # --- handle starting at the cup right rim; apply ratchet, then find retouch ---
+    def _find_handle(self, b: Bars, ri: int, cup_low: float):
+        n = len(b)
+        h_left = ri
+        # RATCHET: a higher high within `ratchet` bars becomes the new handle left rim
+        while True:
+            rim = b.h[h_left]
+            higher = None
+            for k in range(h_left + 1, min(n, h_left + 1 + self.ratchet)):
+                if b.h[k] > rim:
+                    higher = k
+                    break
+            if higher is None:
                 break
-            resistance, i = b.h[nxt], nxt
-        return out
-
-    def _find_handle(self, b: Bars, start: int, resistance: float,
-                     cup_depth: float, a: float):
-        """Find a >=handle_min_bars pullback that stays shallow, then breaks out."""
-        max_depth = cup_depth * self.p["handle_max_depth_frac"]   # 4:1 .. 5:1
-        buffer = self.p["breakout_buffer_atr"] * a
-        min_bars = self.p["handle_min_bars"]
+            h_left = higher
+        rim = b.h[h_left]
+        cup_depth_for_handle = rim - cup_low
+        if cup_depth_for_handle <= 0:
+            return None
+        max_handle_depth = self.h_depth_frac * cup_depth_for_handle
+        trigger = rim + self.entry_off
         handle_low = float("inf")
-        length = 0
-        started = False
-        for j in range(start + 1, len(b)):
-            if started and length >= min_bars and b.c[j] > resistance + buffer:
-                return handle_low, j                      # breakout confirmed
-            if b.h[j] < resistance:                        # inside the pullback
-                started = True
-                length += 1
-                handle_low = min(handle_low, b.l[j])
-                if resistance - handle_low > max_depth:    # handle too deep -> invalid
-                    return None
-        return None
+        for k in range(h_left + 1, min(n, h_left + 1 + self.h_max + 1)):
+            if b.h[k] >= trigger:                       # retouch -> entry
+                length = k - h_left
+                if length >= self.h_min and handle_low < float("inf"):
+                    return h_left, handle_low, k
+                return None                             # broke out too early / no dip
+            handle_low = min(handle_low, b.l[k])
+            if rim - handle_low > max_handle_depth:      # handle too deep
+                return None
+        return None                                      # never retouched in time
 
-    def _next_higher_lip(self, b: Bars, after: int, prev_lip: float) -> Optional[int]:
-        for i in swing_highs(b, k=3):
-            if i > after and b.h[i] > prev_lip:
-                return i
-        return None
-
-    def _triple_barrier(self, b: Bars, entry_idx: int, entry: float,
-                        stop: float, target: float, R: float):
-        max_hold = self.lab["max_hold_bars"] if "max_hold_bars" in self.lab else 240
-        end = min(len(b), entry_idx + max_hold + 1)
+    # --- label: stop / target / flat at 3:49pm (240-bar cap) ---
+    def _label(self, b: Bars, entry_idx: int, entry: float, stop: float,
+               target: float, R: float):
+        end = min(len(b), entry_idx + self.max_hold + 1, _last_bar_by_cutoff(b) + 1)
         mfe = mae = 0.0
         mfe_idx = entry_idx
         for j in range(entry_idx + 1, end):
@@ -230,40 +241,25 @@ class PatternDetector:
                 return -1, j, -1.0, mfe, mfe_idx, mae
             if b.h[j] >= target:
                 return +1, j, (target - entry) / R, mfe, mfe_idx, mae
-        final = (b.c[end-1] - entry) / R if end > entry_idx + 1 else 0.0
+        final = (b.c[end - 1] - entry) / R if end > entry_idx + 1 else 0.0
         return 0, end - 1, final, mfe, mfe_idx, mae
 
 
-# ----------------------------------------------------------------------------
-# Demo — chain Stage 2 -> Stage 3 on the synthetic day
-# ----------------------------------------------------------------------------
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    cfg = {
-        "data": {"timeframes": ["1min"], "session": "RTH",
-                 "adjustment": "split_div", "max_gap_bars": 3, "min_bars": 60},
-        "pattern": {
-            "cup_min_bars": 15, "cup_max_bars": 120,
-            "cup_depth_min_atr": 1.0, "cup_depth_max_atr": 40.0,   # wide for synthetic demo
-            "lip_diff_max_frac_of_depth": 0.25,                    # RULE 1
-            "handle_min_bars": 4, "handle_max_depth_frac": 0.25,   # 4:1 ratio
-            "breakout_buffer_atr": 0.1, "max_handles_per_cup": 3,  # RULE 2
-        },
-        "labeling": {"max_hold_bars": 240},
-    }
-
+    cfg = {"data": {"timeframes": ["1min"], "max_gap_bars": 3, "min_bars": 60},
+           "pattern": {"cup_min_bars": 15, "cup_max_bars": 60,
+                       "right_rim_recovery_frac": 0.25, "handle_min_bars": 4,
+                       "handle_max_bars": 50, "handle_ratchet_bars": 4,
+                       "handle_max_depth_frac": 0.20, "entry_offset_dollars": 0.01},
+           "labeling": {"max_hold_bars": 240}}
     series = DataLayer(cfg, _SyntheticProvider()).load("DELL", Date(2026, 5, 29))
     bars = series.bars["1min"]
-    events = PatternDetector(cfg).detect(bars, "DELL", Date(2026, 5, 29))
-
-    print(f"\nATR(day) = {atr(bars):.3f}   bars = {len(bars)}")
-    print(f"Detected {len(events)} labeled event(s):\n")
-    for e in events:
-        verdict = {1: "WIN ", -1: "LOSS", 0: "TIME"}[e.outcome]
+    evs = PatternDetector(cfg).detect(bars, "DELL", Date(2026, 5, 29))
+    print(f"bars={len(bars)}  detected {len(evs)} cup-and-handle(s)")
+    for e in evs:
+        v = {1: "WIN", -1: "LOSS", 0: "TIME"}[e.outcome]
         print(f"  cup[{e.cup_left_idx}->{e.cup_bottom_idx}->{e.cup_right_idx}] "
-              f"depth={e.cup_depth:.2f} lip_diff={e.lip_diff_frac:.0%}  "
-              f"handle#{e.handle_num} breakout@{e.breakout_idx} "
-              f"entry={e.entry_price:.2f} stop={e.stop_price:.2f}  "
-              f"[{verdict}] pnl={e.pnl_R:+.2f}R  MFE={e.mfe_R:.2f}R@bar{e.mfe_idx}")
+              f"depth={e.cup_depth:.2f} handle_low={e.handle_low:.2f} "
+              f"entry@{e.breakout_idx} {e.entry_price:.2f} stop {e.stop_price:.2f} "
+              f"[{v}] {e.pnl_R:+.2f}R")

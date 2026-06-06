@@ -46,6 +46,10 @@ CONFIG = {
             "micro": {"earnings": {"rev_min": 0.40, "gap_min": 0.10}, "non_earnings": {"gap_min": 0.25}},
         },
 
+        # FLAT earnings-gapper rule (additional include, any size): reported earnings
+        # + revenue growth YoY >= 40% + gap >= 10%. The "very important" subset.
+        "earnings_catalyst": {"rev_min": 0.40, "gap_min": 0.10},
+
         # Trading-only exclusion (kept in RESEARCH universe per our discussion)
         "exclude_from_trading": {
             "energy_beta_above": 0.5,         # exclude high energy-beta names (chemicals/materials proxies) from LIVE trading only
@@ -76,26 +80,17 @@ CONFIG = {
         "premarket_for_gap": True,            # need prev close + today open to compute the gap
     },
 
-    # ============ STAGE 3: PATTERN DETECTION ============
-    # Depth in ATR units (auto-scales across names); geometry from your spec.
+    # ============ STAGE 3: PATTERN DETECTION (v2 spec — pure geometry, no ATR) ============
     "pattern": {
-        "atr_period": 14,                     # ATR on the active timeframe
-        "cup_min_bars": 15,                   # YOUR spec: cup >= 15 bars (per timeframe)
-        "cup_max_bars": 120,
-        "cup_depth_min_atr": 1.5,             # cup >= 1.5 ATR deep
-        "cup_depth_max_atr": 6.0,             # cup <= 6.0 ATR deep
-        "rim_tolerance_atr": 0.5,             # right rim within 0.5 ATR of left rim
-        "handle_min_bars": 4,                 # YOUR spec: handle >= 4 bars
-        "handle_max_bars": 30,
-        # YOUR spec: cup-depth : handle-depth ratio >= 4:1, ideal 5:1
-        "handle_max_depth_frac": 0.25,        # 4:1  -> handle <= 25% of cup depth (minimum quality)
-        "handle_ideal_depth_frac": 0.20,      # 5:1  -> handle <= 20% of cup depth (best)
-        "breakout_buffer_atr": 0.1,           # close must clear rim by >= 0.1 ATR
-        "lip_diff_max_frac_of_depth": 0.25,   # RULE 1: |left lip - right lip| <= 25% of cup depth
-        "max_handles_per_cup": 3,             # RULE 2: one cup can spawn multiple handles
-        "require_prior_trend": True,          # continuation pattern (the gap provides the trend)
-        "prior_trend_lookback": 30,
-        "prior_trend_min_atr": 2.0,
+        "cup_min_bars": 15,                   # cup length 15..60 bars (left rim -> right rim)
+        "cup_max_bars": 60,
+        "right_rim_recovery_frac": 0.25,      # right rim recovers to within 25% of cup depth below left rim
+        # RIM-LINE rule (in code): no bar between rims pokes above the left->right rim line
+        "handle_min_bars": 4,                 # handle length 4..50 bars
+        "handle_max_bars": 50,
+        "handle_ratchet_bars": 4,             # higher-high within 4 bars -> new handle left rim, restart count
+        "handle_max_depth_frac": 0.20,        # handle depth <= 20% of (handle-rim high -> cup low)
+        "entry_offset_dollars": 0.01,         # enter at handle-rim high + $0.01 on retouch; stop = handle low
     },
 
     # ============ STAGE 3b: OUTCOME LABELING (path-based) ============

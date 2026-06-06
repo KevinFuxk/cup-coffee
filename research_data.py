@@ -69,8 +69,9 @@ def _cached(kind: str, key: str, fetch: Callable):
 # ----------------------------------------------------------------------------
 
 class ResearchData:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, fmp_key: Optional[str] = None):
         self.key = api_key
+        self.fmp = fmp_key
 
     def _get(self, url: str, params: dict) -> dict:
         import requests
@@ -79,6 +80,44 @@ class ResearchData:
             return r.json()
         except Exception:
             return {}
+
+    # --- FMP (working `stable` API; retried because the plan rate-limits) ---
+    def _fmp(self, path: str, **params):
+        import requests, time
+        params["apikey"] = self.fmp
+        for _ in range(3):
+            try:
+                r = requests.get(f"https://financialmodelingprep.com/stable/{path}",
+                                 params=params, timeout=30)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                pass
+            time.sleep(0.7)
+        return None
+
+    def earnings_symbols(self, day: Date) -> set:
+        """Set of tickers that REPORTED earnings on `day` (FMP stable, cached)."""
+        def fetch():
+            data = self._fmp("earnings-calendar", **{"from": day.isoformat(), "to": day.isoformat()})
+            return sorted({r["symbol"] for r in data if isinstance(r, dict) and r.get("symbol")}) \
+                if isinstance(data, list) else []
+        return set(_cached("fmp_earn", day.isoformat(), fetch))
+
+    def revenue_growth_yoy(self, symbol: str, before: Date) -> Optional[float]:
+        """YoY revenue growth from POLYGON financials (unlimited, point-in-time): latest
+        quarter filed before `before` vs ~4 quarters earlier. None if unavailable."""
+        fins = self.financials(symbol, before)        # Polygon vX, quarterly, filed before `before`, cached
+        def rev(r):
+            try:
+                return r["financials"]["income_statement"]["revenues"]["value"]
+            except (KeyError, TypeError):
+                return None
+        recs = [r for r in fins if rev(r)]
+        if len(recs) < 5:
+            return None
+        r0, r4 = rev(recs[0]), rev(recs[4])
+        return (r0 / r4 - 1.0) if (r0 and r4) else None
 
     # --- minute bars, rebuilt EXACTLY like PolygonBarProvider so indices match ---
     def _minute_raw(self, symbol: str, day: Date) -> list:
@@ -153,8 +192,14 @@ def label_full_path(b: Bars, breakout_idx: int, entry: float, stop: float,
     Returns full MFE/MAE in R, and the exact realized R for each fixed take-profit.
 
     Intrabar convention matches the original detector: if a bar touches both the
-    stop and a target, the STOP counts first (conservative)."""
-    end = min(len(b), breakout_idx + max_hold_bars + 1)
+    stop and a target, the STOP counts first (conservative).
+    Hold is capped at the 240-bar limit AND flat by 3:49pm ET (intraday only)."""
+    cutoff_idx = len(b) - 1
+    for i in range(len(b) - 1, -1, -1):
+        if b.ts[i].time() <= dtime(15, 49):
+            cutoff_idx = i
+            break
+    end = min(len(b), breakout_idx + max_hold_bars + 1, cutoff_idx + 1)
     mfe = mae = 0.0
     # per-take-profit state: realized R, and whether already resolved
     realized = {k: None for k in take_profits}
