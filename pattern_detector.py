@@ -14,14 +14,15 @@ CUP
   cup_depth = left_rim_high - lowest low between the rims
 
 HANDLE  (left rim of the handle = right rim of the cup)
-  * 4..50 bars long
-  * RATCHET: if within 4 bars a bar makes a higher high than the handle's left rim,
-    that bar becomes the new handle left rim and the 4-bar count restarts
-  * depth (handle_rim_high - handle_low) <= 20% of (handle_rim_high - cup_low)
-  * resolves when price comes back up and retouches the handle rim
+  * 4..60 bars long (counting the rim)
+  * RATCHET only in the opening `ratchet`-bar window: the lip = the highest high of the
+    handle's first few bars; AFTER that the lip is FIXED (it does NOT chase a drift up)
+  * lip must stay within 25% of max(left-to-bottom, lip-to-bottom) of the LEFT rim
+  * depth (lip - handle_low) <= 20% of (lip - cup_low)
 
 ENTRY / STOP
-  * entry = handle_rim_high + $0.01, filled on the bar that reaches it
+  * entry = a BUY-STOP at lip + $0.01; fills on the FIRST retouch at the 4th bar or later
+    (a pure sideways chop just keeps waiting until the handle exceeds 50 bars -> give up)
   * stop  = handle low ;  R = entry - stop
 
 EXIT (for the events.jsonl label; research re-labels full-path)
@@ -39,6 +40,7 @@ from datetime import date as Date, time as dtime
 from typing import Optional
 
 from data_layer import Bars, _SyntheticProvider, DataLayer
+from research_data import session_end_idx
 
 logger = logging.getLogger("cupcoffee.detector")
 
@@ -126,11 +128,14 @@ class PatternDetector:
             bottom_idx, ri = cup
             cup_low = b.l[bottom_idx]
             cup_depth = b.h[li] - cup_low
-            handle = self._find_handle(b, ri, cup_low)
+            handle = self._find_handle(b, ri, cup_low, b.h[li])
             if handle is None:
                 continue
             h_left_idx, handle_low, entry_idx = handle
             if entry_idx in taken_entries:
+                continue
+            end_idx = session_end_idx(b, entry_idx, self.max_hold)
+            if end_idx is None or end_idx <= entry_idx:   # 11:00-13:00 no-trade, or no hold room
                 continue
             rim = b.h[h_left_idx]
             entry = rim + self.entry_off
@@ -140,7 +145,7 @@ class PatternDetector:
             R = entry - stop
             target = entry + cup_depth            # measured move (research re-labels)
             outcome, exit_idx, pnl_R, mfe_R, mfe_idx, mae_R = \
-                self._label(b, entry_idx, entry, stop, target, R)
+                self._label(b, entry_idx, end_idx, entry, stop, target, R)
             events.append(CupHandleEvent(
                 symbol=symbol, day=day, timeframe=b.timeframe,
                 cup_left_idx=li, cup_bottom_idx=bottom_idx, cup_right_idx=ri,
@@ -191,43 +196,44 @@ class PatternDetector:
                 return True
         return False
 
-    # --- handle starting at the cup right rim; apply ratchet, then find retouch ---
-    def _find_handle(self, b: Bars, ri: int, cup_low: float):
+    # --- handle: lip ratchets only in the opening window, then the buy-stop waits ---
+    def _find_handle(self, b: Bars, ri: int, cup_low: float, left_lip: float):
         n = len(b)
-        h_left = ri
-        # RATCHET: a higher high within `ratchet` bars becomes the new handle left rim
-        while True:
-            rim = b.h[h_left]
-            higher = None
-            for k in range(h_left + 1, min(n, h_left + 1 + self.ratchet)):
-                if b.h[k] > rim:
-                    higher = k
-                    break
-            if higher is None:
-                break
-            h_left = higher
-        rim = b.h[h_left]
-        cup_depth_for_handle = rim - cup_low
+        # PHASE 1 — RATCHET (only within the first `ratchet` bars from the cup right rim):
+        # a higher high lifts the handle lip. We enter on a break of the lip, so the lip is
+        # the HIGHEST high of the handle's opening window; after it, the lip is FIXED (it does
+        # NOT chase a slow drift up — that was the old bug that dragged entries to the top).
+        lip_idx = ri
+        for k in range(ri + 1, min(n, ri + self.ratchet)):
+            if b.h[k] > b.h[lip_idx]:
+                lip_idx = k
+        lip = b.h[lip_idx]
+        cup_depth_for_handle = lip - cup_low
         if cup_depth_for_handle <= 0:
             return None
+        # RIM SYMMETRY: the lip must stay within 25% of the LARGER cup depth of the left rim
+        # — rejects a lip that ratcheted far above the cup (entering the top of a run-up).
+        if abs(lip - left_lip) >= self.rim_recov * max(left_lip - cup_low, lip - cup_low):
+            return None
         max_handle_depth = self.h_depth_frac * cup_depth_for_handle
-        trigger = rim + self.entry_off
+        trigger = lip + self.entry_off                  # buy-stop at the lip high + $0.01
+        # PHASE 2 — the handle must be >= h_min bars (incl. the rim) and resolve within h_max
+        # bars: track the dip; ENTER on the FIRST retouch of the lip at the 4th bar or later.
+        # A pure sideways chop just keeps waiting until the handle exceeds h_max -> give up.
+        earliest = max(lip_idx + 1, ri + self.h_min - 1)   # earliest entry = 4th bar incl. rim
         handle_low = float("inf")
-        for k in range(h_left + 1, min(n, h_left + 1 + self.h_max + 1)):
-            if b.h[k] >= trigger:                       # retouch -> entry
-                length = k - h_left
-                if length >= self.h_min and handle_low < float("inf"):
-                    return h_left, handle_low, k
-                return None                             # broke out too early / no dip
+        for k in range(lip_idx + 1, min(n, ri + self.h_max)):
+            if k >= earliest and handle_low < float("inf") and b.h[k] >= trigger:
+                return lip_idx, handle_low, k           # RETOUCH -> buy-stop fills, ENTER
             handle_low = min(handle_low, b.l[k])
-            if rim - handle_low > max_handle_depth:      # handle too deep
+            if lip - handle_low > max_handle_depth:      # handle deeper than 20% of cup -> give up
                 return None
-        return None                                      # never retouched in time
+        return None                                      # never retouched within h_max bars
 
     # --- label: stop / target / flat at 3:49pm (240-bar cap) ---
-    def _label(self, b: Bars, entry_idx: int, entry: float, stop: float,
+    def _label(self, b: Bars, entry_idx: int, end_idx: int, entry: float, stop: float,
                target: float, R: float):
-        end = min(len(b), entry_idx + self.max_hold + 1, _last_bar_by_cutoff(b) + 1)
+        end = end_idx + 1                                  # session deadline (11:00 morning / 15:50 afternoon)
         mfe = mae = 0.0
         mfe_idx = entry_idx
         for j in range(entry_idx + 1, end):
@@ -250,7 +256,7 @@ if __name__ == "__main__":
     cfg = {"data": {"timeframes": ["1min"], "max_gap_bars": 3, "min_bars": 60},
            "pattern": {"cup_min_bars": 15, "cup_max_bars": 60,
                        "right_rim_recovery_frac": 0.25, "handle_min_bars": 4,
-                       "handle_max_bars": 50, "handle_ratchet_bars": 4,
+                       "handle_max_bars": 60, "handle_ratchet_bars": 4,
                        "handle_max_depth_frac": 0.20, "entry_offset_dollars": 0.01},
            "labeling": {"max_hold_bars": 240}}
     series = DataLayer(cfg, _SyntheticProvider()).load("DELL", Date(2026, 5, 29))

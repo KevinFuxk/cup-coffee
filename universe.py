@@ -171,8 +171,7 @@ class DailyUniverseBuilder:
             reason = None
             if s.gap_pct >= th["non_earnings"]["gap_min"]:
                 reason = "momentum_gap"
-            elif (self.provider.had_earnings(s.symbol, as_of)
-                  and s.revenue_growth_yoy is not None
+            elif (s.revenue_growth_yoy is not None          # high-growth gapper (Polygon revenue, no FMP)
                   and s.revenue_growth_yoy >= earn["rev_min"]
                   and s.gap_pct >= earn["gap_min"]):
                 reason = "earnings_gap"

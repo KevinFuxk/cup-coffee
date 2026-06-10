@@ -228,7 +228,7 @@ if __name__ == "__main__":
     rd = ResearchData(os.environ["POLYGON_API_KEY"])
     lib = FeatureLibrary(rd)
     # try on the first few real events
-    evs = [json.loads(l) for l in open("events.jsonl")][:4]
+    evs = [json.loads(l) for l in open("data/events.jsonl")][:4]
     for ev in evs:
         f = lib.compute(ev)
         present = sum(1 for v in f.values() if v is not None)

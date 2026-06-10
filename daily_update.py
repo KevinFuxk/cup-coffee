@@ -40,7 +40,7 @@ import mine_factors
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 POLY = os.environ["POLYGON_API_KEY"]
-TRACK = "factor_track.jsonl"
+TRACK = "data/factor_track.jsonl"
 
 
 def target_session(argv) -> date:
@@ -76,10 +76,10 @@ def main():
     uni = PolygonUniverseProvider(api_key=POLY, had_earnings_fn=None,
                                   energy_beta_fn=None, revenue_fn=None)
     bars = CachedBarProvider(ResearchData(POLY))
-    before = _count("events.jsonl")
-    run_backfill(CONFIG, uni, bars, day, day, out_path="events.jsonl",
-                 checkpoint_path="backfill.checkpoint", sleep_between=0.0)
-    total = _count("events.jsonl")
+    before = _count("data/events.jsonl")
+    run_backfill(CONFIG, uni, bars, day, day, out_path="data/events.jsonl",
+                 checkpoint_path="data/backfill.checkpoint", sleep_between=0.0)
+    total = _count("data/events.jsonl")
     print(f"\n+{total - before} new cup-and-handles on {day}  (pile now {total})\n")
 
     # skip redundant re-scoring on a no-new-trade day (but always seed the track once)

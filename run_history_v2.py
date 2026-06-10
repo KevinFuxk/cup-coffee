@@ -22,13 +22,11 @@ FMP = os.environ.get("FMP_API_KEY")
 
 
 def build_providers():
-    rd = ResearchData(POLY, FMP)
-    def had_earn(s, d):
-        t = s.split(":")[-1]
-        return t in rd.earnings_symbols(d) or t in rd.earnings_symbols(d - timedelta(days=1))
-    def rev(s, d):
-        return rd.revenue_growth_yoy(s, d) if had_earn(s, d) else None
-    uni = PolygonUniverseProvider(POLY, had_earnings_fn=had_earn, energy_beta_fn=None, revenue_fn=rev)
+    # Polygon only (unlimited). Earnings-gapper = revenue growth YoY >= 40% + gap >= 10%,
+    # using Polygon revenue for ALL gappers (no FMP earnings-date gate -> no quota wall).
+    rd = ResearchData(POLY)
+    uni = PolygonUniverseProvider(POLY, had_earnings_fn=None, energy_beta_fn=None,
+                                  revenue_fn=lambda s, d: rd.revenue_growth_yoy(s, d))
     return uni, CachedBarProvider(rd)
 
 
@@ -38,7 +36,7 @@ if __name__ == "__main__":
     start = end - timedelta(days=1440)            # ~3.95 years
     print(f"v2 backfill {start} -> {end}  (new detector + earnings universe + dedup)\n")
     totals = run_backfill(CONFIG, uni, bars, start, end,
-                          out_path="events.jsonl", checkpoint_path="backfill.checkpoint",
+                          out_path="data/events.jsonl", checkpoint_path="data/backfill.checkpoint",
                           sleep_between=0.0)
     print(f"\nDone: {totals['events']} events / {totals['days']} days "
           f"(W {totals['wins']} / L {totals['losses']} / T {totals['timeouts']}).")
