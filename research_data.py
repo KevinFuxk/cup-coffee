@@ -39,6 +39,30 @@ ET = ZoneInfo("America/New_York")
 CACHE_DIR = "cache"
 
 
+# ---- intraday SESSION RULES (the strategy's trading windows) ----
+# Entries only in two windows: morning (open..11:00) and afternoon (13:00..15:50).
+# NO entries 11:00-13:00 (midday lull). Morning trades are flat by 11:00; afternoon
+# trades by 15:50 (3:50pm). Stops/targets can still fire earlier within the window.
+_NO_TRADE = (dtime(11, 0), dtime(13, 0))
+_MORNING_EXIT = dtime(11, 0)
+_EOD_EXIT = dtime(15, 50)
+
+def session_end_idx(b, entry_idx, max_hold_bars):
+    """Last bar this trade may hold to, given its entry time. Returns None if the
+    entry falls in the 11:00-13:00 no-trade window (the trade is skipped)."""
+    et = b.ts[entry_idx].time()
+    if _NO_TRADE[0] <= et < _NO_TRADE[1]:
+        return None
+    deadline = _MORNING_EXIT if et < _NO_TRADE[0] else _EOD_EXIT
+    last = entry_idx
+    for i in range(entry_idx, len(b)):
+        if b.ts[i].time() <= deadline:
+            last = i
+        else:
+            break
+    return min(last, entry_idx + max_hold_bars, len(b) - 1)
+
+
 # ----------------------------------------------------------------------------
 # tiny JSON disk cache
 # ----------------------------------------------------------------------------
@@ -194,12 +218,8 @@ def label_full_path(b: Bars, breakout_idx: int, entry: float, stop: float,
     Intrabar convention matches the original detector: if a bar touches both the
     stop and a target, the STOP counts first (conservative).
     Hold is capped at the 240-bar limit AND flat by 3:49pm ET (intraday only)."""
-    cutoff_idx = len(b) - 1
-    for i in range(len(b) - 1, -1, -1):
-        if b.ts[i].time() <= dtime(15, 49):
-            cutoff_idx = i
-            break
-    end = min(len(b), breakout_idx + max_hold_bars + 1, cutoff_idx + 1)
+    se = session_end_idx(b, breakout_idx, max_hold_bars)
+    end = (se + 1) if se is not None else (breakout_idx + 1)   # midday entry -> no hold (detector skips these)
     mfe = mae = 0.0
     # per-take-profit state: realized R, and whether already resolved
     realized = {k: None for k in take_profits}

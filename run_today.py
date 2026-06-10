@@ -56,7 +56,7 @@ if __name__ == "__main__":
         uni_provider=universe_provider,
         bar_provider=bar_provider,
         start=day, end=day,
-        out_path="events.jsonl",
+        out_path="data/events.jsonl",
         checkpoint_path="live.checkpoint",
         sleep_between=0.3,            # gentle on the API; free Polygon tier needs ~13s instead
     )

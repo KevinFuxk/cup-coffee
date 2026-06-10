@@ -1,5 +1,7 @@
 # large, regenerable chart cache — not needed in the repo (cloud refetches only the new day)
 cache/
+# generated trade charts (regenerable via viz_batch.py)
+charts/
 # logs and OS cruft
 *.log
 .DS_Store
@@ -11,6 +13,7 @@ mined_table*.json
 factor_scores*.json
 factor_track*.jsonl
 *.checkpoint
+*.csv
 # never commit secrets
 .env
 *.key

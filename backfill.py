@@ -64,8 +64,8 @@ def _event_record(e, cand, timeframe: str) -> dict:
 
 
 def run_backfill(config, uni_provider, bar_provider, start: Date, end: Date,
-                 out_path: str = "events.jsonl",
-                 checkpoint_path: str = "backfill.checkpoint",
+                 out_path: str = "data/events.jsonl",
+                 checkpoint_path: str = "data/backfill.checkpoint",
                  sleep_between: float = 0.0) -> dict:
     # resume from checkpoint
     last_done = None
@@ -159,7 +159,7 @@ if __name__ == "__main__":
     from data_layer import _SyntheticProvider as SyntheticBars
 
     # clean start for the demo
-    for f in ("events.jsonl", "backfill.checkpoint"):
+    for f in ("data/events.jsonl", "data/backfill.checkpoint"):
         if os.path.exists(f):
             os.remove(f)
 
@@ -168,11 +168,11 @@ if __name__ == "__main__":
         uni_provider=FakeUniverse(),
         bar_provider=SyntheticBars(),
         start=Date(2026, 5, 25), end=Date(2026, 5, 29),   # one week (Mon-Fri)
-        out_path="events.jsonl",
+        out_path="data/events.jsonl",
     )
 
     print("\n=== events.jsonl (first 2 rows) ===")
-    with open("events.jsonl") as f:
+    with open("data/events.jsonl") as f:
         for line in list(f)[:2]:
             r = json.loads(line)
             print(f"  {r['symbol']:<11} {r['day']} {r['timeframe']} "

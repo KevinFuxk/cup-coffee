@@ -33,9 +33,10 @@ from research_data import ResearchData, label_full_path
 from feature_library import FeatureLibrary
 from factor_scorer import spearman_ic
 
-TAKE_PROFITS = (1, 2, 3, 4, 5)
-TABLE_PATH = "mined_table.json"
-SCORES_PATH = "factor_scores.json"
+TAKE_PROFITS = (1, 2, 3, 4, 5)          # take-profit levels for FACTOR SCORING (small set -> cleaner FDR)
+TABLE_TPS = tuple(range(1, 21))         # 1R..20R grid stored per trade (drives the dashboard take-profit curve)
+TABLE_PATH = "data/mined_table.json"
+SCORES_PATH = "data/factor_scores.json"
 
 
 # ---- stats ----
@@ -88,7 +89,8 @@ def build_table(rd, lib, events, rebuild=False):
         if b is None:
             continue
         lab = label_full_path(b, min(ev["breakout_idx"], len(b)-1),
-                              ev["entry_price"], ev["stop_price"], ev["risk_R"])
+                              ev["entry_price"], ev["stop_price"], ev["risk_R"],
+                              take_profits=TABLE_TPS)
         rows.append({"key": k, "symbol": ev["symbol"], "day": ev["day"], "tier": ev.get("size_tier"),
                      "realized_R": lab["realized_R"], "win": lab["win"],
                      "full_mfe_R": lab["full_mfe_R"], "factors": lib.compute(ev)})
@@ -132,7 +134,7 @@ def score_factor_tp(rows, fname, k):
 def main(rebuild=False):
     rd = ResearchData(os.environ["POLYGON_API_KEY"])
     lib = FeatureLibrary(rd)
-    events = [json.loads(l) for l in open("events.jsonl")]
+    events = [json.loads(l) for l in open("data/events.jsonl")]
     print(f"Assembling table for {len(events)} trades (cached after first run)...")
     rows = build_table(rd, lib, events, rebuild=rebuild)
     print(f"Table ready: {len(rows)} trades.\n")

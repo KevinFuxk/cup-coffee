@@ -86,9 +86,9 @@ CONFIG = {
         "cup_max_bars": 60,
         "right_rim_recovery_frac": 0.25,      # right rim recovers to within 25% of cup depth below left rim
         # RIM-LINE rule (in code): no bar between rims pokes above the left->right rim line
-        "handle_min_bars": 4,                 # handle length 4..50 bars
-        "handle_max_bars": 50,
-        "handle_ratchet_bars": 4,             # higher-high within 4 bars -> new handle left rim, restart count
+        "handle_min_bars": 4,                 # handle length 4..60 bars (entry at the 4th bar or later)
+        "handle_max_bars": 60,
+        "handle_ratchet_bars": 4,             # lip ratchets only in the opening 4 bars, then fixed
         "handle_max_depth_frac": 0.20,        # handle depth <= 20% of (handle-rim high -> cup low)
         "entry_offset_dollars": 0.01,         # enter at handle-rim high + $0.01 on retouch; stop = handle low
     },
