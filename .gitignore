@@ -13,6 +13,7 @@ mined_table*.json
 realprice*.json
 commodity*.json
 entry_type*.json
+cup_strict*.json
 factor_scores*.json
 factor_track*.jsonl
 *.checkpoint

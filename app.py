@@ -45,6 +45,11 @@ def load_entry_type():
     # {event_key: "momentum"|"consolidation"} from enrich_entry_type.py; {} if not built yet
     return json.load(open("data/entry_type.json")) if os.path.exists("data/entry_type.json") else {}
 
+@st.cache_data
+def load_cup_strict():
+    # {event_key: bool} from enrich_cup_strictness.py (True = passes tighter min-symmetry); {} if not built
+    return json.load(open("data/cup_strict.json")) if os.path.exists("data/cup_strict.json") else {}
+
 rd = get_rd()
 
 # --- DATASET SWITCH: which intraday session rule's pile to explore ----------
@@ -76,6 +81,8 @@ COMM = load_commodity()                             # {ticker: True} commodity-s
 HAS_COMMODITY = bool(COMM)
 ET = load_entry_type()                              # {event_key: momentum|consolidation}
 HAS_ENTRYTYPE = bool(ET)
+CS = load_cup_strict()                              # {event_key: True if passes tighter rim-symmetry}
+HAS_CUPSTRICT = bool(CS)
 HAS_SESSION = any(r.get("entry_min") is not None for r in TP.values())
 HAS_REALPRICE = bool(RP)
 
@@ -102,6 +109,9 @@ def is_commodity(e):                                # commodity-sector flag (SIC
 
 def entry_type_of(e):                               # "momentum" (flag) | "consolidation" (true cup+handle) | None
     return ET.get(_k(e))
+
+def cup_strict_of(e):                               # True = passes tighter (min) rim-symmetry | False | None
+    return CS.get(_k(e))
 
 
 def make_fig(e):
@@ -191,6 +201,12 @@ cup_only = sb.checkbox("Cup-and-handle only (drop momentum/flag entries)", value
                          "panel first. (Needs data/entry_type.json from enrich_entry_type.py.)")
 if not HAS_ENTRYTYPE:
     sb.caption("⚠️ data/entry_type.json not found — run `python enrich_entry_type.py`.")
+strict_only = sb.checkbox("Strict cup only (tighter rim symmetry)", value=False,
+                    help="Keeps only the more SYMMETRIC cups (rim-symmetry within 25% of the SMALLER rim-depth — "
+                         "the max→min change). Drops the less-symmetric ~25%. Read the 'Cup strictness' compare "
+                         "panel first. (Needs data/cup_strict.json from enrich_cup_strictness.py.)")
+if not HAS_CUPSTRICT:
+    sb.caption("⚠️ data/cup_strict.json not found — run `python enrich_cup_strictness.py`.")
 
 def cost_in_R(e):
     # entry slippage (1 side) + commission round-trip (2 sides), in $, divided by the REAL dollar
@@ -244,7 +260,8 @@ def keep(e):
 filt_all = [e for e in events if keep(e)]           # before the toggles (the compare panels use this)
 filt = [e for e in filt_all
         if not (excl_commodity and is_commodity(e))
-        and not (cup_only and entry_type_of(e) == "momentum")]
+        and not (cup_only and entry_type_of(e) == "momentum")
+        and not (strict_only and cup_strict_of(e) is not True)]
 
 LEVELS = sorted(int(k) for k in next(iter(TP.values()))["realized_R"]) if TP else [1, 2, 3, 4, 5]
 best_k, best_avg = None, -1e9                        # best fixed take-profit (net of costs) for this set
@@ -428,6 +445,61 @@ if HAS_ENTRYTYPE and filt_all and TP:
                    "(lower = less risk). Tick **Cup-and-handle only** in the sidebar to apply it everywhere.")
 elif not HAS_ENTRYTYPE:
     st.info("Run `python enrich_entry_type.py` to build data/entry_type.json — then this compare panel appears.")
+
+# --- CUP-STRICTNESS COMPARE: loose (current) vs strict (tighter rim symmetry) ---
+st.subheader("Cup strictness — loose (current) vs strict (tighter rim symmetry)")
+if HAS_CUPSTRICT and filt_all and TP:
+    csk = st.selectbox("Compare at take-profit", LEVELS,
+                       index=LEVELS.index(best_k) if best_k in LEVELS else 0, key="cs_tp")
+
+    def _dd3(cum):
+        peak, m = -1e18, 0.0
+        for x in cum:
+            peak = max(peak, x); m = max(m, peak - x)
+        return m
+
+    def _st3(rows):
+        vals = [(e, net_at(e, csk)) for e in rows if net_at(e, csk) is not None]
+        if not vals:
+            return None
+        sv = sorted(vals, key=lambda ev: ev[0]["day"])
+        cum, s = [], 0.0
+        for _, r in sv:
+            s += r; cum.append(s)
+        n, d = len(vals), _dd3(cum)
+        return {"trades": n, "total_R": s, "rpt": s / n,
+                "win": 100 * sum(1 for _, r in vals if r > 0) / n,
+                "dd": d, "calmar": (s / d) if d > 1e-9 else float("inf"),
+                "cum": cum, "dates": [pd.to_datetime(e["day"]) for e, _ in sv]}
+
+    allr = _st3(filt_all)
+    strict = _st3([e for e in filt_all if cup_strict_of(e) is True])
+    looseonly = _st3([e for e in filt_all if cup_strict_of(e) is False])
+    if allr and strict:
+        def _f(d):
+            return {"trades": d["trades"], "total R": round(d["total_R"]),
+                    "R/trade": round(d["rpt"], 3), "win %": round(d["win"]),
+                    "max drawdown (R)": round(d["dd"]),
+                    "Calmar (R÷DD)": ("∞" if d["calmar"] == float("inf") else round(d["calmar"], 2))}
+        cols = {"Loose (all, current)": _f(allr), "Strict cup only": _f(strict)}
+        if looseonly:
+            cols["Loose-only (dropped)"] = _f(looseonly)
+        st.table(pd.DataFrame(cols))
+        figs3 = go.Figure()
+        figs3.add_trace(go.Scatter(x=allr["dates"], y=allr["cum"], mode="lines", name="Loose (all)"))
+        figs3.add_trace(go.Scatter(x=strict["dates"], y=strict["cum"], mode="lines", name="Strict cup only"))
+        figs3.add_hline(y=0, line_color="gray", line_width=1)
+        figs3.update_layout(height=420, xaxis_title="date", yaxis_title=f"cumulative net R @ {csk}R",
+                            title=f"Equity curve — loose vs strict cup (tighter rim symmetry), @ {csk}R",
+                            hovermode="x unified", margin=dict(l=50, r=20, t=50, b=40))
+        st.plotly_chart(figs3, use_container_width=True)
+        ndrop = looseonly["trades"] if looseonly else 0
+        st.caption(f"Tightening to a strict (symmetric) cup drops the **{ndrop}** less-symmetric trades, changing "
+                   f"total by **{strict['total_R']-allr['total_R']:+.0f}R** and max drawdown by "
+                   f"**{strict['dd']-allr['dd']:+.0f}R**. Tick **Strict cup only** in the sidebar to apply it everywhere. "
+                   "(Subset view — to *adopt* strict you'd flip max→min in pattern_detector.py and re-run the backfill.)")
+elif not HAS_CUPSTRICT:
+    st.info("Run `python enrich_cup_strictness.py` to build data/cup_strict.json — then this compare panel appears.")
 
 # --- PER-YEAR PERFORMANCE across take-profit levels (interactive) ---
 st.subheader("Performance by year — across take-profit levels")
