@@ -6,9 +6,8 @@ Rebuilt to the user's exact rules:
 CUP
   * left rim = any closed bar that is a local peak (high >= the bars on either side)
   * cup length 15..60 bars (left rim -> right rim)
-  * NO ATR depth filter
-  * right rim = a later peak that recovers to within 25% of the cup depth below the
-    left rim:  left_high - 0.25*depth <= right_high <= left_high
+  * right rim = a later peak within a 25%-of-cup-depth band around the left rim:
+    left_high - 0.25*depth <= right_high <= left_high + 0.25*depth
   * RIM-LINE rule: no bar between the rims may poke above the straight line drawn
     from the left-rim high to the right-rim high (the cup stays clean under it)
   cup_depth = left_rim_high - lowest low between the rims
@@ -30,6 +29,24 @@ EXIT (for the events.jsonl label; research re-labels full-path)
 
 Downstream field names are unchanged (breakout_idx = the entry bar) so the factor
 library and miner keep working.
+
+WHY THESE EXACT RULES (lessons — every rule fixed a real bug we caught by EYEBALLING
+actual detections, not by theory):
+  * the ±25% rim-symmetry band came from a QQQ run-up that entered on a lopsided
+    "cup" — the band forces the two rims to sit roughly level.
+  * the rim-LINE no-obstruction rule + the momentum logic came from AGEN, whose
+    "right rim" just kept climbing higher and higher with no real retouch.
+  * the handle rewrite (rim = the cup's right rim, buy-stop at rim+$0.01, no lip)
+    came from HCTI, where the old lip/ratchet dragged the entry to the wrong place.
+  * a "rolling" ratchet variant looked great on a clean ~450-day sample but
+    backtested WORSE over the full 5 years -> dropped. The short sample lied; trust
+    the full-period, out-of-sample result.
+  Discipline: cup_coffee_config_v2.sanity_check.eyeball_n_patterns = 20 — LOOK at 20
+  detections before trusting the detector. Pattern rules must be SEEN, not just specified.
+
+FOR ANY STRATEGY: a detector is always "scan clean bars -> emit (entry, stop) signals."
+Swap the geometry (breakout / mean-reversion / flag) and nothing downstream changes,
+because the output contract (entry, stop, R) is fixed.
 """
 
 from __future__ import annotations
@@ -114,6 +131,19 @@ class PatternDetector:
 
     # --- public ---
     def detect(self, b: Bars, symbol: str, day: Date) -> list[CupHandleEvent]:
+        """THE WHOLE PROCESS — turn one day of clean bars into cup-and-handle signals.
+        Four moves, repeated with EVERY bar as a candidate LEFT rim:
+          1. LEFT RIM     — the bar must be a local peak (_is_peak); a cup starts at a high.
+          2. CUP          — _find_cup scans forward 15-60 bars for a RIGHT rim that comes
+                            back up within a ±25% band of the left rim, with the floor
+                            between them as the cup bottom, and nothing poking above the
+                            rim-line.
+          3. HANDLE+ENTRY — _find_handle decides HOW price re-breaks the right rim and sets
+                            the buy-stop trigger (momentum = enter fast / consolidation =
+                            wait for a real handle).
+          4. ENTRY/STOP   — entry = rim + $0.01, stop = handle low, R = entry - stop.
+        Each survivor becomes a CupHandleEvent — the fixed output contract that feeds
+        labeling, costs, and the dashboard. `taken_entries` keeps one entry per bar."""
         n = len(b)
         if n < self.cup_min + self.h_min + 2:
             return []
@@ -161,6 +191,13 @@ class PatternDetector:
 
     # --- cup: left rim li already a peak; find a valid right rim ---
     def _find_cup(self, b: Bars, li: int):
+        """Move 2 — from the left rim `li` (already a peak), find a valid RIGHT rim `ri`:
+          * 15-60 bars later and itself a local peak,
+          * its high within a ±25% band of the left rim (rim_recov × cup_depth) — the rims
+            sit roughly level, so it's a real cup, not a lopsided drift,
+          * the rim-LINE is clean: no bar between the rims pokes above the straight line
+            joining the two rim highs (see _obstructed).
+        The lowest low between the rims is the cup bottom. Returns (bottom_idx, ri) or None."""
         left_high = b.h[li]
         hi_lim = min(len(b), li + self.cup_max + 1)
         bottom_low = float("inf")          # running lowest low over the cup interior (li, ri)
@@ -178,7 +215,7 @@ class PatternDetector:
             if cup_depth <= 0:
                 continue
             # right rim recovers to within 25% of cup depth, and does not exceed the left rim
-            if right_high < left_high - self.rim_recov * cup_depth or right_high > left_high:
+            if right_high < left_high - self.rim_recov * cup_depth or right_high > left_high + self.rim_recov * cup_depth:
                 continue
             # RIM-LINE: nothing between the rims pokes above the line joining them
             if self._obstructed(b, li, left_high, ri, right_high):
@@ -196,39 +233,50 @@ class PatternDetector:
                 return True
         return False
 
-    # --- handle: lip ratchets only in the opening window, then the buy-stop waits ---
+    # --- handle: buy-stop at the cup right rim (ri) + $0.01, filled on the first touch ---
     def _find_handle(self, b: Bars, ri: int, cup_low: float, left_lip: float):
+        """Move 3 — the handle + the entry trigger. The rim is the cup's right rim (`ri`);
+        entry is a BUY-STOP at rim + $0.01, filled the first time price reaches it. The 2nd
+        bar (ri+1) decides the style:
+          * MOMENTUM       — it already makes a new high (no pullback): enter on the first
+                             break, NO 4-bar wait (the fast 'high tight flag'-like re-break).
+          * CONSOLIDATION  — it makes a lower high (a handle is forming): require the 4-bar
+                             floor, so entry only fires once price recovers to rim + $0.01.
+        Guards: rim symmetry (within 25% of the larger cup depth) and handle depth ≤ 20% of
+        the cup. Returns (ri, handle_low, entry_idx) or None."""
         n = len(b)
-        # PHASE 1 — RATCHET (only within the first `ratchet` bars from the cup right rim):
-        # a higher high lifts the handle lip. We enter on a break of the lip, so the lip is
-        # the HIGHEST high of the handle's opening window; after it, the lip is FIXED (it does
-        # NOT chase a slow drift up — that was the old bug that dragged entries to the top).
-        lip_idx = ri
-        for k in range(ri + 1, min(n, ri + self.ratchet)):
-            if b.h[k] > b.h[lip_idx]:
-                lip_idx = k
-        lip = b.h[lip_idx]
-        cup_depth_for_handle = lip - cup_low
+        # RIM = the cup's right rim (ri). NO lip, NO ratchet. Entry is a BUY-STOP at ri + $0.01,
+        # filled the FIRST time price reaches it — which collapses both cases into one rule:
+        #   * momentum (price reclaims ri fast)        -> fills in a couple bars (no 4-bar wait)
+        #   * consolidation (price dips into a handle)  -> can't fill during the dip, so it fills
+        #     only when price recovers to ri+$0.01, which naturally takes 4+ bars
+        rim = b.h[ri]
+        cup_depth_for_handle = rim - cup_low
         if cup_depth_for_handle <= 0:
             return None
-        # RIM SYMMETRY: the lip must stay within 25% of the LARGER cup depth of the left rim
-        # — rejects a lip that ratcheted far above the cup (entering the top of a run-up).
-        if abs(lip - left_lip) >= self.rim_recov * max(left_lip - cup_low, lip - cup_low):
+        # RIM SYMMETRY (4:1): the two rims must differ by < 25% of the SMALLER rim-to-bottom
+        # depth — i.e. that depth must be >=4x the rim difference. min() (the shallower side)
+        # makes this stricter than max(), so lopsided cups are rejected more aggressively.
+        if abs(rim - left_lip) >= self.rim_recov * min(left_lip - cup_low, rim - cup_low):
             return None
         max_handle_depth = self.h_depth_frac * cup_depth_for_handle
-        trigger = lip + self.entry_off                  # buy-stop at the lip high + $0.01
-        # PHASE 2 — the handle must be >= h_min bars (incl. the rim) and resolve within h_max
-        # bars: track the dip; ENTER on the FIRST retouch of the lip at the 4th bar or later.
-        # A pure sideways chop just keeps waiting until the handle exceeds h_max -> give up.
-        earliest = max(lip_idx + 1, ri + self.h_min - 1)   # earliest entry = 4th bar incl. rim
+        trigger = rim + self.entry_off                  # buy-stop at ri + $0.01
+        if ri + 1 >= n:
+            return None
+        # CASE SPLIT on the 2nd bar (ri+1):
+        #   * it HOLDS the rim's high (ri is the peak, so "holds" = equal) -> MOMENTUM: price kept
+        #     pressing up, no pullback -> enter on the first break of ri+$0.01, NO 4-bar floor.
+        #   * it makes a LOWER high -> CONSOLIDATION: a handle is pulling back -> apply the 4-bar floor.
+        momentum = b.h[ri + 1] >= rim - 1e-9
+        earliest = (ri + 1) if momentum else (ri + self.h_min - 1)   # 4-bar floor only for consolidation
         handle_low = float("inf")
-        for k in range(lip_idx + 1, min(n, ri + self.h_max)):
-            if k >= earliest and handle_low < float("inf") and b.h[k] >= trigger:
-                return lip_idx, handle_low, k           # RETOUCH -> buy-stop fills, ENTER
+        for k in range(ri + 1, min(n, ri + self.h_max)):
+            if k >= earliest and handle_low < float("inf") and b.h[k] >= trigger:   # break of ri+$0.01
+                return ri, handle_low, k
             handle_low = min(handle_low, b.l[k])
-            if lip - handle_low > max_handle_depth:      # handle deeper than 20% of cup -> give up
+            if rim - handle_low > max_handle_depth:      # handle deeper than 20% of cup -> give up
                 return None
-        return None                                      # never retouched within h_max bars
+        return None                                      # never reached ri+$0.01 within h_max bars
 
     # --- label: stop / target / flat at 3:49pm (240-bar cap) ---
     def _label(self, b: Bars, entry_idx: int, end_idx: int, entry: float, stop: float,

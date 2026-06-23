@@ -10,6 +10,9 @@ __pycache__/
 # regenerable data state (rebuilt from code + APIs; not source) and local backups
 events*.jsonl
 mined_table*.json
+realprice*.json
+commodity*.json
+entry_type*.json
 factor_scores*.json
 factor_track*.jsonl
 *.checkpoint

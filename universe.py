@@ -202,24 +202,12 @@ class DailyUniverseBuilder:
 
 
 # ----------------------------------------------------------------------------
-# Provider implementations (wire your data source — see prior notes)
+# Provider implementation lives in providers_historical.py
 # ----------------------------------------------------------------------------
-
-class LiveTradingViewProvider:
-    """LIVE via `tradingview-screener`. Add `market_cap_basic` to the select.
-    Supplement had_earnings() with an earnings calendar; compute gap from
-    prev_close + open. NOT survivorship-correct for history."""
-    def universe_snapshot(self, as_of): raise NotImplementedError
-    def had_earnings(self, symbol, as_of): raise NotImplementedError
-    def energy_beta(self, symbol, as_of, window_days): raise NotImplementedError
-
-
-class HistoricalProvider:
-    """BACKTEST via Polygon/LSEG. MUST include delisted names point-in-time,
-    as-reported revenue (no restatements), adjusted prev_close for the gap."""
-    def universe_snapshot(self, as_of): raise NotImplementedError
-    def had_earnings(self, symbol, as_of): raise NotImplementedError
-    def energy_beta(self, symbol, as_of, window_days): raise NotImplementedError
+# The real, survivorship-correct backtest provider is `PolygonUniverseProvider`
+# in providers_historical.py: it pulls Polygon grouped-daily (delisted names
+# INCLUDED -> no survivorship bias) and feeds SecuritySnapshot rows into the
+# funnel above. (Unused Live/Historical interface stubs were removed from here.)
 
 
 # ----------------------------------------------------------------------------

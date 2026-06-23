@@ -40,6 +40,11 @@ RTH_BARS_1MIN = 390   # 09:30-16:00 inclusive of open minute
 
 @dataclass
 class Bars:
+    """The ATOM of the data layer — ONE symbol, ONE day, ONE timeframe, stored as six
+    PARALLEL lists: bar i is (ts[i], o[i], h[i], l[i], c[i], v[i]), all the same length.
+    Plain lists, NOT pandas, on purpose — the detector indexes these millions of times and
+    `b.h[i]` must be instant (a pandas `.iloc[i]` would be ~100x slower). Rule of thumb:
+    pandas at the edges (analysis/reporting), plain arrays in the hot core."""
     symbol: str
     date: Date
     timeframe: str                 # "1min" | "2min" | "5min"
@@ -82,6 +87,10 @@ class DataLayer:
         self.min_bars = config.get("data", {}).get("min_bars", 60)
 
     def load(self, symbol: str, day: Date) -> Optional[IntradaySeries]:
+        """Gatekeeper loop: for each timeframe, ask the provider for bars, VALIDATE them,
+        keep only the clean ones. If nothing survives, drop the whole day (return None) with
+        a recorded reason. Validation lives HERE, not in the provider — so swapping the data
+        source (synthetic / Polygon / cached) never changes the quality bar."""
         bundle: dict[str, Bars] = {}
         flags: list[str] = []
         for tf in self.cfg["timeframes"]:
@@ -100,6 +109,10 @@ class DataLayer:
         return IntradaySeries(symbol=symbol, date=day, bars=bundle, quality_flags=flags)
 
     def _validate(self, bars: Bars) -> Optional[str]:
+        """The bouncer — returns a REASON string to reject the day, or None if clean.
+        Three checks (better to trade nothing than mine garbage): too few bars (can't hold
+        a pattern), too many zero-volume bars (halts), and bad ticks (high < low or a
+        non-positive price = corrupt data)."""
         if len(bars) < self.min_bars:
             return f"too_few_bars({len(bars)})"
         # drop halt / zero-volume bars; if too many, reject the day
@@ -127,6 +140,10 @@ class DataLayer:
 # ----------------------------------------------------------------------------
 
 def downsample(one_min: Bars, factor: int, timeframe: str) -> Bars:
+    """Collapse every `factor` one-minute bars into one bar — the universal candle rule:
+    open = FIRST bar's open, high = MAX high of the group, low = MIN low, close = LAST
+    bar's close, volume = SUM. So a single 1-min fetch feeds 2- and 5-min too.
+    e.g. AVXL: 389 one-min bars -> 78 five-min bars (factor=5)."""
     o=[]; h=[]; l=[]; c=[]; v=[]; ts=[]
     for i in range(0, len(one_min), factor):
         chunk = slice(i, i + factor)
@@ -141,6 +158,10 @@ def downsample(one_min: Bars, factor: int, timeframe: str) -> Bars:
 # ----------------------------------------------------------------------------
 # Provider stubs to wire later
 # ----------------------------------------------------------------------------
+# NOTE: these two are UNUSED interface sketches (same pattern as the old universe.py
+# stubs). The LIVE bar source is research_data.CachedBarProvider -> ResearchData.bars(),
+# which does the regular-hours filter and calls downsample() above. They remain only as a
+# template for wiring a different data vendor.
 
 class PolygonProvider:
     """Wire: GET /v2/aggs/ticker/{sym}/range/1/minute/{day}/{day}?adjusted=true

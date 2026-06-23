@@ -33,7 +33,7 @@ take profit** (grab 1R, or hold for more). Survivorship-correct, point-in-time.
 | file | what |
 |---|---|
 | `cup_coffee_config_v2.py` | every tunable: cup/handle geometry, session windows, universe tiers |
-| `pattern_detector.py` | the v2 detector — cup → handle (ratchet + buy-stop entry) → stop/target/session-exit label |
+| `pattern_detector.py` | the v2 detector — cup (±25% rim band) → handle (buy-stop at rim+$0.01; momentum vs consolidation split) → stop/target/session-exit label |
 | `data_layer.py` | `Bars` container + 1→2→5-min downsampling |
 
 **🌐 Universe** — what's eligible each day
@@ -46,8 +46,10 @@ take profit** (grab 1R, or hold for more). Survivorship-correct, point-in-time.
 **📊 Data & features**
 | file | what |
 |---|---|
-| `research_data.py` | disk-cached Polygon access · `label_full_path` (exact realized R at every take-profit) · session-exit logic |
+| `research_data.py` | disk-cached Polygon access · `label_full_path` (exact realized R at every take-profit) · session-exit logic · corporate-`splits()` fetch |
 | `feature_library.py` | ~28 point-in-time factors (technical / macro / fundamental / news / calendar / noise-control) |
+| `enrich_real_price.py` | recover each trade's **real (un-split-adjusted) price** + reverse-split count from split history → `data/realprice.json` (drives the $15 screen + honest costs) |
+| `enrich_commodity.py` | flag each ticker as **commodity-sector** (SIC-based) → `data/commodity.json` (drives the include-vs-exclude compare panel) |
 
 **⛏️ Mining & scoring**
 | file | what |
@@ -75,6 +77,8 @@ take profit** (grab 1R, or hold for more). Survivorship-correct, point-in-time.
 |---|---|
 | `events.jsonl` | every detected trade — geometry, entry/stop, measured-move label |
 | `mined_table.json` | per-trade full-path labels (realized R at **1R–20R**) + factor values |
+| `realprice.json` | per-trade **real (un-split-adjusted) price**, real dollar-risk, and reverse-split count — built by `enrich_real_price.py` |
+| `commodity.json` | per-ticker **commodity-sector flag** (SIC-based, true/false) — built by `enrich_commodity.py` |
 | `factor_scores.json` | the factor × take-profit scoring output |
 | `backfill.checkpoint` | last completed day (resume marker) |
 | `backtest_v2.csv` | flat export of the pile |
@@ -95,7 +99,9 @@ Everything in `data/` is **regenerable from code + the Polygon API**, so it's gi
 
 ```bash
 streamlit run app.py              # explore every trade + take-profit equity curves (localhost:8501)
-python run_history_v2.py          # rebuild the ~4-year pile (resumable — safe to stop/restart)
+python run_history_v2.py          # rebuild the ~5-year pile (resumable — safe to stop/restart)
+python enrich_real_price.py       # tag trades with REAL (un-split-adjusted) price + reverse-split count
+python enrich_commodity.py        # flag commodity-sector tickers (SIC-based) for the include/exclude compare
 python mine_factors.py --rebuild  # re-mine factors + take-profit grid on the current pile
 python daily_update.py            # detect today's trades and re-score
 python test_detector.py           # detector unit checks
@@ -108,5 +114,7 @@ python test_detector.py           # detector unit checks
 - **R** — risk per trade = entry − stop. All P/L is in R, so trades compare fairly.
 - **Full-path label** — instead of one baked-in target, every trade records its result at *each* fixed take-profit (1R…20R) plus its peak (MFE). That's what lets us answer "take 1R or hold?"
 - **Min stop** — a real pattern needs a stop that's a meaningful % of price; sub-noise tiny stops (handle ≈ 0) produce nonsense R-multiples and are filtered (slider in the dashboard).
-- **Session rule** — no entries 11:00–13:00; morning entries flat by 11:00, afternoon entries flat by 15:50.
+- **Real price & the $15 screen** — Polygon prices are split-**adjusted**, so a stock that later did a big **reverse** split shows a hugely inflated history (DBGI: real ~$6 in 2021 → shown as $678k). Since commission/slippage are fixed ¢/share, that inflation makes their cost look ≈ 0 when in reality (penny prices, cents-wide stops) it's brutal. `enrich_real_price.py` recovers the real price from split history; the dashboard then **costs every trade at its real price** and **drops sub-$15 (real-price) penny stocks by default**. `rev_splits` per trade = how many reverse splits that ticker ever did (a distress flag, shown not filtered).
+- **Commodity exclusion (compare, don't dump)** — to avoid commodity names (oil/gas, gold/silver/copper/steel, coal, ag) and direct producers like Exxon, `enrich_commodity.py` flags each ticker by its **SIC industry code** — precise, because it catches producers but *not* industrials like Caterpillar that merely sell to miners (keyword-on-description would over-exclude). The dashboard shows an **include-vs-exclude compare panel** (return + risk) so you judge from the data before applying the exclusion.
+- **Session rule** — two datasets, switchable in the dashboard's **Dataset** toggle: **all-day** (live: entries any time 9:30–15:49, morning trades held *through* lunch) and the older **lunch rule** (no entries 11:00–13:00, morning flat at 11:00). Both flat by 15:49.
 - **Noise canary** — fake random factors are scored alongside real ones; if they "pass," the bar is too low.

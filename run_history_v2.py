@@ -33,7 +33,7 @@ def build_providers():
 if __name__ == "__main__":
     uni, bars = build_providers()
     end = date.today()
-    start = end - timedelta(days=1440)            # ~3.95 years
+    start = end - timedelta(days=1815)            # ~5 years (the current Polygon plan's limit)
     print(f"v2 backfill {start} -> {end}  (new detector + earnings universe + dedup)\n")
     totals = run_backfill(CONFIG, uni, bars, start, end,
                           out_path="data/events.jsonl", checkpoint_path="data/backfill.checkpoint",
