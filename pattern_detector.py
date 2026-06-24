@@ -254,10 +254,10 @@ class PatternDetector:
         cup_depth_for_handle = rim - cup_low
         if cup_depth_for_handle <= 0:
             return None
-        # RIM SYMMETRY (4:1): the two rims must differ by < 25% of the SMALLER rim-to-bottom
-        # depth — i.e. that depth must be >=4x the rim difference. min() (the shallower side)
-        # makes this stricter than max(), so lopsided cups are rejected more aggressively.
-        if abs(rim - left_lip) >= self.rim_recov * min(left_lip - cup_low, rim - cup_low):
+        # RIM SYMMETRY (LOOSE): rim within 25% of the LARGER rim-to-bottom depth. max() is the
+        # lenient side — chosen because LOOSE beat STRICT (min) head-to-head: more total return,
+        # lower drawdown, better Calmar at every take-profit. (Strict pile kept for comparison.)
+        if abs(rim - left_lip) >= self.rim_recov * max(left_lip - cup_low, rim - cup_low):
             return None
         max_handle_depth = self.h_depth_frac * cup_depth_for_handle
         trigger = rim + self.entry_off                  # buy-stop at ri + $0.01

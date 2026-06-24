@@ -510,7 +510,7 @@ def load_pile(ev_path, tab_path, rp_path):
     evl = [json.loads(l) for l in open(ev_path) if l.strip()]
     tabl = {r["key"]: r for r in json.load(open(tab_path)) if "key" in r}
     return evl, tabl, json.load(open(rp_path))
-_strict_pile = load_pile("data/events.jsonl", "data/mined_table.json", "data/realprice.json")
+_strict_pile = load_pile("data/events_strict_cup.jsonl", "data/mined_table_strict_cup.json", "data/realprice_strict_cup.json")
 _loose_pile  = load_pile("data/events_loose_cup.jsonl", "data/mined_table_loose_cup.json", "data/realprice_loose_cup.json")
 if _strict_pile and _loose_pile:
     lvk = st.selectbox("Compare at take-profit", LEVELS,
