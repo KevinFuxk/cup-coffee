@@ -122,6 +122,7 @@ class PatternDetector:
         self.cup_min = p.get("cup_min_bars", 15)
         self.cup_max = p.get("cup_max_bars", 60)
         self.rim_recov = p.get("right_rim_recovery_frac", 0.25)
+        self.rim_mode = p.get("rim_symmetry", "max")   # "max" = loose (live) | "min" = strict
         self.h_min = p.get("handle_min_bars", 4)
         self.h_max = p.get("handle_max_bars", 50)
         self.ratchet = p.get("handle_ratchet_bars", 4)
@@ -254,10 +255,11 @@ class PatternDetector:
         cup_depth_for_handle = rim - cup_low
         if cup_depth_for_handle <= 0:
             return None
-        # RIM SYMMETRY (LOOSE): rim within 25% of the LARGER rim-to-bottom depth. max() is the
-        # lenient side — chosen because LOOSE beat STRICT (min) head-to-head: more total return,
-        # lower drawdown, better Calmar at every take-profit. (Strict pile kept for comparison.)
-        if abs(rim - left_lip) >= self.rim_recov * max(left_lip - cup_low, rim - cup_low):
+        # RIM SYMMETRY: rim within 25% of a rim-to-bottom depth. config "rim_symmetry" picks which:
+        #   "max" (LOOSE, live default) = lenient (larger depth); "min" (STRICT) = tighter (smaller depth).
+        # LOOSE is live because it beat STRICT head-to-head (more total return, lower drawdown, better Calmar).
+        _depth = min if self.rim_mode == "min" else max
+        if abs(rim - left_lip) >= self.rim_recov * _depth(left_lip - cup_low, rim - cup_low):
             return None
         max_handle_depth = self.h_depth_frac * cup_depth_for_handle
         trigger = rim + self.entry_off                  # buy-stop at ri + $0.01

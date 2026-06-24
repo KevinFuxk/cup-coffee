@@ -85,6 +85,7 @@ CONFIG = {
         "cup_min_bars": 15,                   # cup length 15..60 bars (left rim -> right rim)
         "cup_max_bars": 60,
         "right_rim_recovery_frac": 0.25,      # right rim recovers to within 25% of cup depth below left rim
+        "rim_symmetry": "max",                # "max" = loose (LIVE) | "min" = strict (tighter rim symmetry)
         # RIM-LINE rule (in code): no bar between rims pokes above the left->right rim line
         "handle_min_bars": 4,                 # handle length 4..60 bars (entry at the 4th bar or later)
         "handle_max_bars": 60,

@@ -12,10 +12,12 @@ Reads cached bars -> fast, no re-download. Run after a backfill changes events.j
 from __future__ import annotations
 import os, json
 from datetime import date as Date
+import sys
 from research_data import ResearchData, label_full_path
 
-EVENTS = "data/events.jsonl"
-OUT = "data/mined_table.json"
+# optional argv: <events_path> <out_path> (defaults = the live pile)
+EVENTS = sys.argv[1] if len(sys.argv) > 1 else "data/events.jsonl"
+OUT    = sys.argv[2] if len(sys.argv) > 2 else "data/mined_table.json"
 TPS = tuple(range(1, 21))
 
 
