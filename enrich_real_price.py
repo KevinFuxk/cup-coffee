@@ -23,11 +23,12 @@ cache/splits/, so re-runs are instant and resume if interrupted.
     python enrich_real_price.py
 """
 from __future__ import annotations
-import os, json
+import os, json, sys
 from research_data import ResearchData
 
-EVENTS = "data/events.jsonl"
-OUT    = "data/realprice.json"
+# optional argv: <events_path> <out_path> (defaults = the live strict pile)
+EVENTS = sys.argv[1] if len(sys.argv) > 1 else "data/events.jsonl"
+OUT    = sys.argv[2] if len(sys.argv) > 2 else "data/realprice.json"
 
 
 def key(e):

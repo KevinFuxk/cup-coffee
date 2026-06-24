@@ -501,6 +501,79 @@ if HAS_CUPSTRICT and filt_all and TP:
 elif not HAS_CUPSTRICT:
     st.info("Run `python enrich_cup_strictness.py` to build data/cup_strict.json — then this compare panel appears.")
 
+# --- LOOSE vs STRICT CUP: two independent piles, head to head ---
+st.subheader("Loose vs Strict cup — the two backtests, head to head")
+@st.cache_data
+def load_pile(ev_path, tab_path, rp_path):
+    if not (os.path.exists(ev_path) and os.path.exists(tab_path) and os.path.exists(rp_path)):
+        return None
+    evl = [json.loads(l) for l in open(ev_path) if l.strip()]
+    tabl = {r["key"]: r for r in json.load(open(tab_path)) if "key" in r}
+    return evl, tabl, json.load(open(rp_path))
+_strict_pile = load_pile("data/events.jsonl", "data/mined_table.json", "data/realprice.json")
+_loose_pile  = load_pile("data/events_loose_cup.jsonl", "data/mined_table_loose_cup.json", "data/realprice_loose_cup.json")
+if _strict_pile and _loose_pile:
+    lvk = st.selectbox("Compare at take-profit", LEVELS,
+                       index=LEVELS.index(best_k) if best_k in LEVELS else 0, key="lv_tp")
+    _FEE = (slippage + 2 * commission) / 100.0
+    def _pile_verdict(pile, k):
+        evl, tabl, rpl = pile
+        rows = []
+        for e in evl:
+            kk = f'{e["symbol"]}|{e["day"]}|{e["timeframe"]}|{e.get("breakout_idx")}|{e.get("handle_num")}'
+            m = tabl.get(kk)
+            if not m or str(k) not in m["realized_R"]:
+                continue
+            r = rpl.get(kk, {})
+            rprice = r.get("real_price", e.get("entry_price") or 0)
+            rrisk = r.get("real_risk") or e.get("risk_R") or 0
+            stoppct = (e["risk_R"] / e["entry_price"] * 100) if e.get("entry_price") else 0
+            if rprice < minprice or stoppct < minstop:        # SAME screen as the sidebar sliders
+                continue
+            rows.append((e["day"], m["realized_R"][str(k)] - (_FEE / rrisk if rrisk > 0 else 0)))
+        if not rows:
+            return None
+        rows.sort()
+        cum, s = [], 0.0
+        for _, nr in rows:
+            s += nr; cum.append(s)
+        mdd = 0.0; peak = -1e18
+        for c in cum:
+            peak = max(peak, c); mdd = max(mdd, peak - c)
+        daily = defaultdict(float)
+        for d, nr in rows:
+            daily[d] += nr
+        ds = list(daily.values()); mn = sum(ds) / len(ds)
+        sd = (sum((x - mn) ** 2 for x in ds) / len(ds)) ** 0.5
+        n = len(rows)
+        return {"trades": n, "total": s, "rpt": s / n, "win": 100 * sum(1 for _, nr in rows if nr > 0) / n,
+                "mdd": mdd, "sharpe": (mn / sd * 252 ** 0.5 if sd > 1e-9 else 0),
+                "calmar": (s / mdd if mdd > 1e-9 else float("inf")),
+                "cum": cum, "dates": [pd.to_datetime(d) for d, _ in rows]}
+    lv = _pile_verdict(_loose_pile, lvk)
+    sv = _pile_verdict(_strict_pile, lvk)
+    if lv and sv:
+        def _f(d):
+            return {"trades": d["trades"], "total R": round(d["total"]), "R/trade": round(d["rpt"], 3),
+                    "win %": round(d["win"]), "max drawdown (R)": round(d["mdd"]),
+                    "Sharpe (ann)": round(d["sharpe"], 2),
+                    "Calmar": ("∞" if d["calmar"] == float("inf") else round(d["calmar"], 2))}
+        st.table(pd.DataFrame({"Loose cup": _f(lv), "Strict cup": _f(sv)}))
+        figlv = go.Figure()
+        figlv.add_trace(go.Scatter(x=lv["dates"], y=lv["cum"], mode="lines", name="Loose cup"))
+        figlv.add_trace(go.Scatter(x=sv["dates"], y=sv["cum"], mode="lines", name="Strict cup"))
+        figlv.add_hline(y=0, line_color="gray", line_width=1)
+        figlv.update_layout(height=440, xaxis_title="date", yaxis_title=f"cumulative net R @ {lvk}R",
+                            title=f"Loose vs Strict cup — two independent backtests, net @ {lvk}R (your screen + cost settings)",
+                            hovermode="x unified", margin=dict(l=50, r=20, t=50, b=40))
+        st.plotly_chart(figlv, use_container_width=True)
+        st.caption("Two INDEPENDENT piles, both run through your sidebar min-stop / min-price / cost settings: "
+                   "**Loose** = the pre-strict pile (`events_loose_cup.jsonl`), **Strict** = the current re-run "
+                   "(`events.jsonl`, max→min rim symmetry). Move the take-profit selector to compare at any level.")
+else:
+    st.info("Loose vs Strict needs both piles. Loose = data/*_loose_cup.* — if missing, run: "
+            "`python enrich_real_price.py data/events_loose_cup.jsonl data/realprice_loose_cup.json`.")
+
 # --- PER-YEAR PERFORMANCE across take-profit levels (interactive) ---
 st.subheader("Performance by year — across take-profit levels")
 if filt and TP:
