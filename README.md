@@ -1,5 +1,7 @@
 # Cup Coffee ☕ — intraday cup-and-handle research
 
+> **Layout note (2026-08):** the offline pipeline now lives in `research/`, one-off utilities in `tools/`, superseded code in `archive/superseded/`. The authoritative file-by-file directory is **what_the_code_actually_does.md §10**.
+
 Detect intraday cup-and-handle setups on US-equity **gappers** (1/2/5-min charts),
 label each trade's **full outcome path**, and mine **which factors tell you when to
 take profit** (grab 1R, or hold for more). Survivorship-correct, point-in-time.
@@ -67,7 +69,7 @@ take profit** (grab 1R, or hold for more). Survivorship-correct, point-in-time.
 
 **🧪 Factor loop (stage 5, exploratory)** — `loop.py`, `claude_research.py`
 **📈 Dashboard & viz** — `app.py` (Streamlit Trade Explorer), `viz_trades.py` / `viz_batch.py` (static PNGs)
-**✅ Tests** — `test_detector.py`
+**✅ Tests** — `tests/test_cup_coffee.py` (14 cases against the CURRENT rolling-rim rules; run after any strategy change)
 
 ---
 
@@ -99,12 +101,11 @@ Everything in `data/` is **regenerable from code + the Polygon API**, so it's gi
 
 ```bash
 streamlit run app.py              # explore every trade + take-profit equity curves (localhost:8501)
-python run_history_v2.py          # rebuild the ~5-year pile (resumable — safe to stop/restart)
-python enrich_real_price.py       # tag trades with REAL (un-split-adjusted) price + reverse-split count
-python enrich_commodity.py        # flag commodity-sector tickers (SIC-based) for the include/exclude compare
-python mine_factors.py --rebuild  # re-mine factors + take-profit grid on the current pile
-python daily_update.py            # detect today's trades and re-score
-python test_detector.py           # detector unit checks
+python research/run_history_v2.py          # rebuild the ~5-year pile (resumable — safe to stop/restart)
+python research/enrich_real_price.py       # tag trades with REAL (un-split-adjusted) price + reverse-split count
+python research/enrich_commodity.py        # flag commodity-sector tickers (SIC-based) for the include/exclude compare
+python research/mine_factors.py --rebuild  # re-mine factors + take-profit grid on the current pile
+python research/daily_update.py            # detect today's trades and re-score
 ```
 
 ---

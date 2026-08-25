@@ -3,6 +3,10 @@ study_data_layer.py — SEE what each data-side file produces, for ONE trade (AV
 A learning aid: run it, read the labeled output, then open each file knowing what it makes.
     python study_data_layer.py
 """
+# this file lives in a subfolder — put the project root on sys.path and work from it
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, _ROOT); _os.chdir(_ROOT)
 import os, hashlib
 from datetime import date as Date
 from cup_coffee_config_v2 import CONFIG          # FILE A: the rules/knobs

@@ -32,7 +32,7 @@ jobs:
       - name: Detect today's trades, re-score factors
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
-        run: python daily_update.py
+        run: python research/daily_update.py
       - name: Commit updated data back to the repo
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: |

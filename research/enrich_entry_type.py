@@ -15,6 +15,10 @@ Run in your terminal (POLYGON_API_KEY from ~/.zshrc). Bars are cached -> fast.
     python enrich_entry_type.py
 """
 from __future__ import annotations
+# this file lives in a subfolder — put the project root on sys.path and work from it
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, _ROOT); _os.chdir(_ROOT)
 import os, json
 from datetime import date as Date
 from research_data import ResearchData

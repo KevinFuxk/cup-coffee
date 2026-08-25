@@ -9,6 +9,10 @@ timeframe dedup (1>2>5min within 5 min). Charts are cached; FMP is retried/cache
 Writes a FRESH events.jsonl (the launcher backs up the old one). Background, hours.
 """
 from __future__ import annotations
+# this file lives in a subfolder — put the project root on sys.path and work from it
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, _ROOT); _os.chdir(_ROOT)
 import os, logging
 from datetime import date, timedelta
 from cup_coffee_config_v2 import CONFIG

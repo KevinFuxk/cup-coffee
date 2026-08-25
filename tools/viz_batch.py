@@ -1,4 +1,8 @@
 """viz_batch.py — generate a diverse batch of detected cup-and-handle charts to eyeball."""
+# this file lives in a subfolder — put the project root on sys.path and work from it
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, _ROOT); _os.chdir(_ROOT)
 import os
 from viz_trades import plot, EVENTS
 

@@ -1,4 +1,8 @@
 """build_nb.py — generate data_cleaning_walkthrough.ipynb (a teaching notebook)."""
+# this file lives in a subfolder — put the project root on sys.path and work from it
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, _ROOT); _os.chdir(_ROOT)
 import nbformat as nbf
 
 nb = nbf.v4.new_notebook()
@@ -150,5 +154,5 @@ Change `MIN_STOP`, `MIN_PRICE`, or `FEE` above and re-run to watch the clean set
 nb["cells"] = cells
 nb["metadata"] = {"kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
                   "language_info": {"name": "python"}}
-nbf.write(nb, "data_cleaning_walkthrough.ipynb")
+nbf.write(nb, "tools/data_cleaning_walkthrough.ipynb")
 print(f"wrote data_cleaning_walkthrough.ipynb  ({len(cells)} cells)")

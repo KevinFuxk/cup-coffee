@@ -20,6 +20,10 @@ Run `python claude_research.py` to PRINT the exact prompt that would be sent
 """
 
 from __future__ import annotations
+# this file lives in a subfolder — put the project root on sys.path and work from it
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, _ROOT); _os.chdir(_ROOT)
 
 import json
 from dataclasses import dataclass

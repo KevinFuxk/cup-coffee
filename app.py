@@ -170,7 +170,7 @@ minprice = sb.slider("Min REAL price ($)", 0.0, 50.0, 15.0, 1.0,
                          "(Needs data/realprice.json from enrich_real_price.py.)")
 if not HAS_REALPRICE:
     sb.caption("⚠️ data/realprice.json not found — real-price screen & honest costs are OFF "
-               "(falling back to adjusted prices). Run `python enrich_real_price.py`.")
+               "(falling back to adjusted prices). Run `python research/enrich_real_price.py`.")
 sb.caption("**Costs** — subtracted from every R")
 commission = sb.slider("Commission (¢/share, each way)", 0.0, 1.0, 0.3, 0.05,
                        help="Per-share broker fee, charged on BOTH the buy and the sell. STG / day-trading brokers ≈ 0.2–0.5¢.")
@@ -184,13 +184,13 @@ excl_commodity = sb.checkbox("Exclude commodity stocks", value=False,
                          "panel EXCEPT its compare panel. Default OFF — read the 'Commodity stocks' compare panel "
                          "first. (Needs data/commodity.json from enrich_commodity.py.)")
 if not HAS_COMMODITY:
-    sb.caption("⚠️ data/commodity.json not found — run `python enrich_commodity.py`.")
+    sb.caption("⚠️ data/commodity.json not found — run `python research/enrich_commodity.py`.")
 cup_only = sb.checkbox("Cup-and-handle only (drop momentum/flag entries)", value=False,
                     help="Drops momentum-path entries (fast re-break, no handle — the 'high tight flag' case), "
                          "keeping only true cup-and-handle (consolidation) entries. Read the 'Entry type' compare "
                          "panel first. (Needs data/entry_type.json from enrich_entry_type.py.)")
 if not HAS_ENTRYTYPE:
-    sb.caption("⚠️ data/entry_type.json not found — run `python enrich_entry_type.py`.")
+    sb.caption("⚠️ data/entry_type.json not found — run `python research/enrich_entry_type.py`.")
 
 def cost_in_R(e):
     # entry slippage (1 side) + commission round-trip (2 sides), in $, divided by the REAL dollar
@@ -373,7 +373,7 @@ if HAS_COMMODITY and filt_all and TP:
                    f"and max drawdown by **{exc['mdd']-inc['mdd']:+.0f}R** (lower drawdown = less risk). "
                    "Decide from the numbers, then tick **Exclude commodity stocks** in the sidebar to apply it everywhere.")
 elif not HAS_COMMODITY:
-    st.info("Run `python enrich_commodity.py` to build data/commodity.json — then this compare panel appears.")
+    st.info("Run `python research/enrich_commodity.py` to build data/commodity.json — then this compare panel appears.")
 
 # --- ENTRY-TYPE COMPARE: true cup-and-handle (consolidation) vs momentum (flag) ---
 st.subheader("Entry type — true cup-and-handle vs momentum (flag) entries")
@@ -427,7 +427,7 @@ if HAS_ENTRYTYPE and filt_all and TP:
                    f"**{cons['total_R']-allr['total_R']:+.0f}R** and max drawdown by **{cons['dd']-allr['dd']:+.0f}R** "
                    "(lower = less risk). Tick **Cup-and-handle only** in the sidebar to apply it everywhere.")
 elif not HAS_ENTRYTYPE:
-    st.info("Run `python enrich_entry_type.py` to build data/entry_type.json — then this compare panel appears.")
+    st.info("Run `python research/enrich_entry_type.py` to build data/entry_type.json — then this compare panel appears.")
 
 # --- LOOSE vs STRICT CUP: two independent piles, head to head ---
 st.subheader("Loose vs Strict cup — the two backtests, head to head")
@@ -500,7 +500,7 @@ if _strict_pile and _loose_pile:
                    "(`events.jsonl`, max→min rim symmetry). Move the take-profit selector to compare at any level.")
 else:
     st.info("Loose vs Strict needs both piles. Loose = data/*_loose_cup.* — if missing, run: "
-            "`python enrich_real_price.py data/events_loose_cup.jsonl data/realprice_loose_cup.json`.")
+            "`python research/enrich_real_price.py data/events_loose_cup.jsonl data/realprice_loose_cup.json`.")
 
 # --- PER-YEAR PERFORMANCE across take-profit levels (interactive) ---
 st.subheader("Performance by year — across take-profit levels")
