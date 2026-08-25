@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:claude.ai)"
+      "WebFetch(domain:claude.ai)",
+      "Bash(/Users/k.z/anaconda3/bin/python -c \"import nbformat; print\\('OK', nbformat.__version__\\)\")",
+      "Bash(/usr/bin/python3 -c \"import nbformat; print\\('OK', nbformat.__version__\\)\")"
     ]
   }
 }

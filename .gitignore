@@ -21,3 +21,13 @@ factor_track*.jsonl
 # never commit secrets
 .env
 *.key
+# raw market-data slices + generated data artifacts (data stays local by design)
+data/splits/
+data/*.html
+data/watchlist.txt
+data/idx_multitf.json
+data/*.superseded
+# editor + local backups + shell accidents
+.vscode/
+*.bak-*
+archive/junk/
