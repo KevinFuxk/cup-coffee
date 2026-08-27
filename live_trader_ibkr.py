@@ -66,7 +66,11 @@ def resolve_watchlist(path: str) -> str | None:
     import glob
     if path and path != "auto":
         return path if os.path.exists(path) else None
-    cands = glob.glob(os.path.expanduser("~/Downloads/*DayTrade*.txt"))
+    # match case-INSENSITIVELY: TradingView names the export after the watchlist,
+    # and "daytrade" vs "DayTrade" must not silently fall back to a stale list
+    # (2026-08-26: a lowercase rename made the bot trade the 8/21 watchlist).
+    cands = [c for c in glob.glob(os.path.expanduser("~/Downloads/*.txt"))
+             if "daytrade" in os.path.basename(c).lower()]
     if cands:
         newest = max(cands, key=os.path.getmtime)
         return newest
