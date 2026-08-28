@@ -245,6 +245,47 @@ def test_real_day_golden():
     print(f"   (SPY {day}: {len(got)} event(s) reproduced exactly)")
 
 
+def _mini_trader(replay: bool):
+    """A Trader wired to dummies — just enough to exercise reconcile()'s arm path."""
+    from argparse import Namespace
+    from live_trader_ibkr import Trader
+
+    class DummyIB:
+        def accountValues(self): return []
+        def reqGlobalCancel(self): pass
+        def positions(self): return []
+    a = Namespace(replay=replay, arm=False, minstop=0.0, risk=0.01, base=10000,
+                  tp=6.0, max_positions=5)
+    tr = Trader(DummyIB(), None, None, a, agg_ks=[])
+    tr._report = True
+    return tr
+
+
+def test_no_arming_after_eod_flatten():
+    """The 2026-08-24 audit hole: the 15:49 flatten is followed by the aggregators'
+    final 2/5-min buckets (stamped < 15:49) reaching reconcile — LIVE must refuse to
+    arm a fresh bracket there, or a DAY buy-stop rests 15:49-16:00 with no flatten
+    behind it and a fill survives overnight."""
+    b = bars_from_hl(golden_hl()[:25])              # armable forming setup (bar-3 close)
+    tr = _mini_trader(replay=False)
+    tr.eod_done = True                              # the day's flatten already fired
+    tr.reconcile("TEST", "1min", b)
+    assert tr.pending == {}, "live armed a bracket AFTER the EOD flatten — overnight risk"
+    tr.eod_done = False                             # sanity: same call arms during the day
+    tr.reconcile("TEST", "1min", b)
+    assert "TEST" in tr.pending and abs(tr.pending["TEST"]["trigger"] - 99.81) < 1e-9
+
+
+def test_replay_still_arms_after_first_symbols_eod():
+    """The July trap: replay walks symbols sequentially, so a later symbol's whole day
+    arrives with eod_done already True — replay must KEEP arming (shadow-only)."""
+    b = bars_from_hl(golden_hl()[:25])
+    tr = _mini_trader(replay=True)
+    tr.eod_done = True                              # set by the previous symbol's 15:49
+    tr.reconcile("TEST", "1min", b)
+    assert "TEST" in tr.pending, "the eod_done guard must never block replay's later symbols"
+
+
 # --------------------------------------------------------------------------- runner
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

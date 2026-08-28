@@ -207,15 +207,17 @@ different (worse) population, and the min-stop screen is what mostly protects li
 - A dethrone (bar high > rim) cancels the pending bracket on the closed bar that did it.
 - Bars stamped ≥ 15:49 never reach `reconcile`; the first such bar triggers the global EOD
   flatten (once), and shadow stop/TP exits on that same 15:49 bar are honored **before** the
-  flatten. ⚠️ **A verified hole (found 2026-08-24, unfixed):** the 15:49 **1-min** bar, after
+  flatten. ✅ **A verified hole (found 2026-08-24, FIXED 2026-09-02):** the 15:49 **1-min** bar, after
   firing the flatten, still feeds the aggregators — which flush the 15:48 2-min and 15:45
   5-min buckets. Those bars are stamped *before* 15:49, so they DO reach `reconcile`, whose
   pending slot the flatten just cleared — and can arm a **new** bracket *after* the EOD
   flatten. In `--arm` mode nothing cancels it (the post-EOD cleanup branch is shadow-only):
   a DAY buy-stop rests until 16:00 and, if it fills, the position can survive overnight.
-  Low probability (needs an armable forming setup at exactly that moment) but real. The
-  in-code comment claiming impossibility (live_trader_ibkr.py ~line 525) makes the same
-  unsound argument.
+  **The fix:** live mode never arms again once the day's flatten has fired
+  (`eod_done and not replay` guard in `reconcile`); replay is exempt on purpose — its
+  sequential symbol walks are why the naive gate broke replay in July. Both directions
+  are locked in by tests (`test_no_arming_after_eod_flatten`,
+  `test_replay_still_arms_after_first_symbols_eod`).
 
 **Prices traded:**
 
@@ -317,7 +319,7 @@ Things the code assumes without saying so. Each one is a place reality can diver
 |---|---|---|
 | SPY/QQQ 5-min, 22 yr (n=1080) | −0.293 R/tr, t=−6.00 vs random | **CLOSED: no edge** |
 | SPY/QQQ all six feasible tfs, 2.5 yr (n=1502) | −0.056 R/tr, t=−2.08 vs random | **CLOSED: worse than random** |
-| Gappers, today's rules (n≈1379 honest) | +0.226 R/tr, t=+3.29, all years positive | edge vs random **unresolved** (t=+1.35) — the open gate before real money |
+| Gappers, today's rules (n≈1379 honest) | +0.226 R/tr, t=+3.29, all years positive | sharpened null (2026-09-02, paired, 10 draws/trade): vs clean whole-session random **t=+1.96**; vs fair time-matched (after-entry-only) random **t=+3.89**. ⚠️ A ±30-min matched window is CONTAMINATED — draws before the entry embed the future breakout (they "earn" +1.47R/tr, unachievable). Fill-fantasy bound (same audit): 5.9% of entries gap over the trigger (p95 = 1.00R worse); 11.5% of entry bars touch the stop that no labeler checks — worst-case −146R of the +312R edge |
 
 Contamination note: every rule choice (rolling rim, loose symmetry, 0.25% floor, $15, 6R TP)
 was made after seeing the full 2021-2026 gapper pile → those numbers are in-sample. The only

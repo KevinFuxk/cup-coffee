@@ -526,10 +526,17 @@ class Trader:
             else:
                 self.update_pending(sym, st, B)
         else:
-            # No eod_done gate here — bars at/after 15:49 never reach reconcile (diverted to the
-            # flatten branch), so after-hours arming is impossible by construction. The old gate
-            # was redundant AND broke replay: the first symbol's 15:49 blocked every later
-            # symbol's whole day (sequential walks share the flag).
+            # POST-EOD ARMING GUARD (audit find 2026-08-24, fixed 2026-09-02). Bars >= 15:49
+            # never reach reconcile, BUT the 15:49 1-min bar still flushes the aggregators,
+            # whose final 2/5-min buckets are stamped 15:45-15:48 and land HERE *after* the
+            # flatten cleared the book. Arming off them would leave a fresh DAY bracket
+            # resting 15:49-16:00 with nothing left to flatten it -> a fill there survives
+            # OVERNIGHT. So live mode never arms again once the day's flatten has fired.
+            # Replay stays exempt on purpose: it walks symbols SEQUENTIALLY (a later
+            # symbol's whole day arrives after the first symbol's 15:49), which is exactly
+            # the naive eod_done gate that broke replay in July.
+            if self.eod_done and not self.a.replay:
+                return
             for ri, st in sorted(scan.items()):        # arm the oldest armable forming setup
                 if st["state"] == "forming" and n >= st["earliest"] and st["stop"] < float("inf"):
                     self.arm_pending(sym, tf, ri, st, B)
