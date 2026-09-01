@@ -9,7 +9,7 @@ THE PATTERN — five stages, each with its geometry AND the market meaning behin
      MEANING: the old high — the price where buyers last failed. Everyone who bought
      there is trapped and remembers it.
 
-  2. CUP — 15..60 bars from left rim to right rim; the lowest low between them is the
+  2. CUP — >=15 bars from left rim to right rim (upper cap removed 2026-09-02); the lowest low between them is the
      bottom; cup_depth = left_rim_high - bottom. RIM-LINE rule: no bar between the rims
      may poke above the straight line joining the two rim highs (the cup stays hollow).
      MEANING: the round trip of control — sellers push it down, exhaust themselves,
@@ -32,8 +32,8 @@ THE PATTERN — five stages, each with its geometry AND the market meaning behin
      supply is exhausted. A deeper handle = plenty of sellers left = setup dead.
 
   5. BREAKOUT / ENTRY — a resting BUY-STOP at right_rim + $0.01, filled on the first
-     touch; stop = handle low; R = entry - stop; give up if the handle runs past
-     handle_max bars without breaking out.
+     touch; stop = handle low; R = entry - stop; give up only if the handle
+     dies by depth or the session ends (handle cap removed 2026-09-02).
      MEANING: we never predict — the market must PROVE buyers absorbed the last supply
      by crossing the ceiling. Above the rim there are no trapped sellers left to fight
      through. Below the handle low the "supply is gone" story is falsified — which is
@@ -139,15 +139,14 @@ class PatternDetector:
     def __init__(self, config: dict):
         p = config["pattern"]
         self.cup_min = p.get("cup_min_bars", 15)
-        self.cup_max = p.get("cup_max_bars", 60)
+        self.cup_max = p.get("cup_max_bars")     # None = no cap (2026-09-02) — session-bounded
         self.rim_recov = p.get("right_rim_recovery_frac", 0.25)
         self.rim_mode = p.get("rim_symmetry", "max")   # "max" = loose (live) | "min" = strict
         self.rim_roll = p.get("rolling_rim", False)    # USER SPEC 2026-07-20 (test flag, default OFF):
         # a pre-entry handle bar rising ABOVE the rim DETHRONES it -> the rim rolls to the next
         # bar that is a true peak (re-passing every cup gate); until then, no trade.
         self.h_min = p.get("handle_min_bars", 4)
-        self.h_max = p.get("handle_max_bars", 50)
-        self.ratchet = p.get("handle_ratchet_bars", 4)
+        self.h_max = p.get("handle_max_bars")    # None = no cap (2026-09-02) — session-bounded
         self.h_depth_frac = p.get("handle_max_depth_frac", 0.20)
         self.entry_off = p.get("entry_offset_dollars", 0.01)
         self.max_hold = config.get("labeling", {}).get("max_hold_bars", 240)
@@ -248,7 +247,7 @@ class PatternDetector:
         The band says "recovered to the old ceiling", scaled by the cup's own depth; the
         rim line keeps it a hollow valley instead of a stair-step rally."""
         left_high = b.h[li]
-        hi_lim = min(len(b), li + self.cup_max + 1)
+        hi_lim = min(len(b), li + self.cup_max + 1) if self.cup_max else len(b)
         bottom_low = float("inf")          # running lowest low over the cup interior (li, ri)
         bottom_idx = li
         for ri in range(li + 1, hi_lim):
@@ -329,7 +328,7 @@ class PatternDetector:
         momentum = (not self.rim_roll) and b.h[ri + 1] >= rim - 1e-9
         earliest = (ri + 1) if momentum else (ri + self.h_min - 1)
         handle_low = float("inf")
-        for k in range(ri + 1, min(n, ri + self.h_max)):
+        for k in range(ri + 1, min(n, ri + self.h_max) if self.h_max else n):
             if k >= earliest and handle_low < float("inf") and b.h[k] >= trigger:   # break of ri+$0.01
                 return ri, handle_low, k
             if self.rim_roll and b.h[k] > rim + 1e-9:    # USER SPEC 2026-07-20: pre-entry bar rises

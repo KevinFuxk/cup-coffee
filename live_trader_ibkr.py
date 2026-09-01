@@ -134,6 +134,24 @@ def read_watchlist(cli_symbols: str | None, path: str) -> tuple[list[str], str]:
     return list(DEFAULT_SYMS), "built-in DEFAULT_SYMS"
 
 
+def archive_watchlist(path: str | None) -> None:
+    """THE POINT-IN-TIME UNIVERSE LOG (pivot decision 2026-09-02). The manual
+    news-source watchlist is the one input that cannot be reconstructed later —
+    so every trading day's export is copied to data/watchlists/YYYY-MM-DD.txt
+    (source ###SECTION tags preserved verbatim). Idempotent: the newest export
+    of the day wins; tiny text files, committed to git for free backup."""
+    if not path or not os.path.exists(path):
+        return
+    os.makedirs("data/watchlists", exist_ok=True)
+    dst = f"data/watchlists/{datetime.now(ET):%Y-%m-%d}.txt"
+    content = open(path).read()
+    if os.path.exists(dst) and open(dst).read() == content:
+        return
+    with open(dst, "w") as f:
+        f.write(content)
+    print(f"  📚 watchlist archived -> {dst}")
+
+
 def scan_setups(det: PatternDetector, b: Bars) -> dict[int, dict]:
     """Every cup setup and the CURRENT state of its handle, keyed by right-rim index.
 
@@ -169,7 +187,8 @@ def scan_setups(det: PatternDetector, b: Bars) -> dict[int, dict]:
             momentum = (not det.rim_roll) and b.h[ri + 1] >= rim - 1e-9
             earliest = max((ri + 1) if momentum else (ri + det.h_min - 1), ri + 2)
             state, entry_bar, hl, rolled = None, None, float("inf"), False
-            for k in range(ri + 1, min(n, ri + det.h_max)):   # the detector's exact handle walk
+            walk_end = min(n, ri + det.h_max) if det.h_max else n
+            for k in range(ri + 1, walk_end):                 # the detector's exact handle walk
                 if k >= earliest and hl < float("inf") and b.h[k] >= trigger:
                     state, entry_bar = "entered", k
                     break
@@ -183,7 +202,7 @@ def scan_setups(det: PatternDetector, b: Bars) -> dict[int, dict]:
             if rolled:
                 continue
             if state is None:                          # walk ran out of bars
-                state = "dead" if n >= ri + det.h_max else "forming"
+                state = "dead" if (det.h_max and n >= ri + det.h_max) else "forming"
             if ri not in out:                          # first successful li wins (detector order)
                 out[ri] = dict(state=state, trigger=trigger, stop=hl, earliest=earliest,
                                entry_bar=entry_bar, momentum=momentum)
@@ -773,7 +792,9 @@ def main():
     print(f"  data: {'delayed' if a.delayed else 'real-time'} | tfs {','.join(tfs)} (one stream, local agg) | "
           f"risk {a.risk*100:.1f}% | tp {a.tp:g}R | cap {a.max_positions} | fills -> {FILLS_CSV}")
     print(f"  watchlist ({len(syms)}) from {src}")
-    print(f"  watching {', '.join(syms)}\n")
+    print(f"  watching {', '.join(syms)}")
+    archive_watchlist(resolve_watchlist(a.watchlist))
+    print()
 
     def on_update(bars, has_new_bar):
         if has_new_bar:

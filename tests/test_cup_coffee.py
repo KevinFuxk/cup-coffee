@@ -239,8 +239,12 @@ def test_real_day_golden():
         if dtime(9, 30) <= t.time() <= dtime(15, 59):
             b.ts.append(t); b.o.append(x["o"]); b.h.append(x["h"]); b.l.append(x["l"])
             b.c.append(x["c"]); b.v.append(x.get("v", 0))
+    # the reference pile was built under the RETIRED caps (cup/handle <= 60); pin them
+    # here so this test keeps proving DETECTOR-CORE reproducibility, not the live config
+    dcap = PatternDetector({**CONFIG, "pattern": {**CONFIG["pattern"],
+                                                  "cup_max_bars": 60, "handle_max_bars": 60}})
     got = sorted((e.breakout_idx, round(e.entry_price, 4))
-                 for e in det().detect(b, "SPY", b.date, signals_only=True))
+                 for e in dcap.detect(b, "SPY", b.date, signals_only=True))
     assert got == want, f"SPY {day}: pile {want} vs re-detect {got}"
     print(f"   (SPY {day}: {len(got)} event(s) reproduced exactly)")
 

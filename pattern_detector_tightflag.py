@@ -99,9 +99,11 @@ logger = logging.getLogger("tightflag.detector")
 
 CONFIG = {
     "strategy": "tightflag",
-    "timeframe": "5min",
+    "timeframe": "1min",           # USER DECISION 2026-09-02: HTF runs on 1-MINUTE bars
+                                   #   (rules unchanged — only the clock width moved)
     "ratio_min": 2.0,             # bar1 range >= ratio_min x bar2 range (both sides)
-    "min_coverage": 5,            # USER 2026-07-25: each setup window needs ALL 5 minutes
+    "min_coverage": 1,            # full coverage of the window (was 5 on 5-min bars;
+                                  #   a 1-min window is fully covered by its 1 print)
     "fly_trigger_R": 1.75,        # USER 2026-07-25: trailing arms only if favorable
     "fly_by_bar": 4,              #   excursion hits fly_trigger_R during clock bars 3-4
     "trail_from_bar": 4,          # first stop move at the CLOSE of this bar (1-based)
@@ -133,8 +135,8 @@ _EOD_T = dtime(*map(int, CONFIG["eod_flat"].split(":")))
 # clock-aligned 5-minute bars
 # ----------------------------------------------------------------------------
 
-def clock_5min(one: Bars) -> tuple[Bars, list[int], list[int]]:
-    """Clock-aligned 5-min bars from 1-min bars: bucket k = [09:30+5k, 09:35+5k).
+def clock_bars(one: Bars, width: int) -> tuple[Bars, list[int], list[int]]:
+    """Clock-aligned `width`-minute bars from 1-min bars: bucket k = [09:30+w*k, ...).
     Returns (bars, bucket_index per bar, 1-min coverage count per bar).
 
     This matches the live MinuteAggregator convention (windows anchored to the
@@ -150,20 +152,20 @@ def clock_5min(one: Bars) -> tuple[Bars, list[int], list[int]]:
     for i in range(len(one)):
         t = one.ts[i]
         mod = t.hour * 60 + t.minute
-        k = (mod - _OPEN_MIN) // 5
+        k = (mod - _OPEN_MIN) // width
         if mod < _OPEN_MIN or k < 0:
             continue
         if buckets and buckets[-1] == k:
             h[-1] = max(h[-1], one.h[i]); l[-1] = min(l[-1], one.l[i])
             c[-1] = one.c[i]; v[-1] += one.v[i]; cov[-1] += 1
         else:
-            start = _OPEN_MIN + 5 * k
+            start = _OPEN_MIN + width * k
             o.append(one.o[i]); h.append(one.h[i]); l.append(one.l[i])
             c.append(one.c[i]); v.append(one.v[i])
             ts.append(t.replace(hour=start // 60, minute=start % 60,
                                 second=0, microsecond=0))
             buckets.append(k); cov.append(1)
-    bars = Bars(one.symbol, one.date, "5min", ts, o, h, l, c, v, one.adjusted)
+    bars = Bars(one.symbol, one.date, f"{width}min", ts, o, h, l, c, v, one.adjusted)
     return bars, buckets, cov
 
 
@@ -175,7 +177,7 @@ def clock_5min(one: Bars) -> tuple[Bars, list[int], list[int]]:
 class TightFlagEvent:
     symbol: str
     day: Date
-    timeframe: str                 # always "5min"
+    timeframe: str                 # the clock width the event was built on
     side: str                      # "long" | "short" (bar 1's color)
     # the two setup bars (clock windows 09:30-09:35 and 09:35-09:40)
     b1_o: float; b1_h: float; b1_l: float; b1_c: float; b1_v: float
@@ -426,10 +428,20 @@ def prev_close_gate(setup: dict, prev_close: Optional[float],
     return setup["side"] == "long" and setup["h1"] < prev_close
 
 
+def cfg_width(cfg: dict) -> int:
+    """Bar width in minutes from the config timeframe ('1min' -> 1)."""
+    return int(cfg["timeframe"].rstrip("min"))
+
+
+def clock_5min(one: Bars) -> tuple[Bars, list[int], list[int]]:
+    """Legacy alias — the OLD 5-min pile and its viewers were built on this width."""
+    return clock_bars(one, 5)
+
+
 def scan_day(one_min: Bars, symbol: str, day: Date,
              cfg: dict = CONFIG,
              prev_close: Optional[float] = None) -> tuple[Optional[TightFlagEvent], str]:
-    five, buckets, cov = clock_5min(one_min)
+    five, buckets, cov = clock_bars(one_min, cfg_width(cfg))
     setup, why = detect(five, buckets, cov, cfg)
     if setup is None:
         return None, why
@@ -451,7 +463,7 @@ def scan_day(one_min: Bars, symbol: str, day: Date,
     lab = label_trail(five, buckets, entry_price, stop0, r_unit, side, cfg)
 
     e = TightFlagEvent(
-        symbol=symbol, day=day, timeframe="5min", side=side,
+        symbol=symbol, day=day, timeframe=cfg["timeframe"], side=side,
         b1_o=five.o[0], b1_h=five.h[0], b1_l=five.l[0], b1_c=five.c[0], b1_v=five.v[0],
         b2_o=five.o[1], b2_h=five.h[1], b2_l=five.l[1], b2_c=five.c[1], b2_v=five.v[1],
         cov1=setup["cov1"], cov2=setup["cov2"],

@@ -1,12 +1,17 @@
 """
-CUP COFFEE — Strategy Configuration v2
-=======================================
-US equities + QQQ/SPY whitelist. 1 / 2 / 5-minute charts.
-Event-driven daily universe (pre-market gapper scan), NOT a static list.
-
-CORE IDEA: trade intraday cup-and-handle patterns that form AFTER a
-momentum gap, plus the two index ETFs. Research target is EXIT TIMING —
-which factors say hold to 3-4h vs take the 1h profit vs cut at breakeven.
+CUP COFFEE — Strategy Configuration v3 (THE PIVOT, 2026-09-02)
+===============================================================
+THE PROGRAM NOW: two strategies, one universe, forward-tested.
+  * 15-SECOND cup-and-handle (this config) — cup >= 15 bars, handle >= 4 bars,
+    NO upper bar caps (the session is the only bound; user decision 2026-09-02).
+  * 1-MINUTE high tight flag (pattern_detector_tightflag.py — same rules,
+    timeframe only).
+UNIVERSE: manually fed each day — story stocks >= $15 picked from trusted
+sources (The FLY, CNBC, MarketChameleon, Stocktwits) via the TradingView
+export; every day's list is archived point-in-time to data/watchlists/
+(that archive is what makes the forward test a future backtest).
+The 2021-2026 gapper/index research program is CLOSED — its verdicts live in
+what_the_code_actually_does.md §7; its piles remain as reference only.
 
 BUILD ORDER:
   Stage 1  Daily universe scan   -> whitelist + qualifying gappers, per day
@@ -68,8 +73,6 @@ CONFIG = {
     "data": {
         "timeframes": ["1min", "2min", "5min"],   # detector runs on all three
         "session": "RTH",                     # 09:30-16:00 ET only
-        "history_start": "2024-01-01",        # 1yr to prototype; extend after validation
-        "history_end":   "2024-12-31",
         "adjustment": "split_div",            # adjusted for analysis; keep raw for execution
         "include_delisted": True,             # CRITICAL — survivorship correctness
         "max_gap_bars": 3,
@@ -82,8 +85,8 @@ CONFIG = {
 
     # ============ STAGE 3: PATTERN DETECTION (v2 spec — pure geometry, no ATR) ============
     "pattern": {
-        "cup_min_bars": 15,                   # cup length 15..60 bars (left rim -> right rim)
-        "cup_max_bars": 60,
+        "cup_min_bars": 15,                   # cup >= 15 bars (left rim -> right rim)
+        "cup_max_bars": None,                 # USER DECISION 2026-09-02: no upper cap — session-bounded
         "right_rim_recovery_frac": 0.25,      # right rim recovers to within 25% of cup depth below left rim
         "rim_symmetry": "max",                # "max" = loose (LIVE) | "min" = strict (tighter rim symmetry)
         "rolling_rim": True,                  # USER DECISION 2026-07-20 — THE rim definition (LIVE):
@@ -91,9 +94,8 @@ CONFIG = {
                                               # the rim may only move to a peak-confirmed higher bar that
                                               # re-passes every gate; until then, no trade.
         # RIM-LINE rule (in code): no bar between rims pokes above the left->right rim line
-        "handle_min_bars": 4,                 # handle length 4..60 bars (entry at the 4th bar or later)
-        "handle_max_bars": 60,
-        "handle_ratchet_bars": 4,             # lip ratchets only in the opening 4 bars, then fixed
+        "handle_min_bars": 4,                 # entry at handle bar 4 or later
+        "handle_max_bars": None,              # USER DECISION 2026-09-02: no upper cap — session-bounded
         "handle_max_depth_frac": 0.20,        # handle depth <= 20% of (handle-rim high -> cup low)
         "entry_offset_dollars": 0.01,         # enter at handle-rim high + $0.01 on retouch; stop = handle low
     },
@@ -101,19 +103,13 @@ CONFIG = {
     # ============ STAGE 3b: OUTCOME LABELING (path-based) ============
     # Structural stop from your spec + PATH capture for the exit-timing research.
     "labeling": {
-        "entry": "breakout_close",            # enter at close of confirmed breakout bar
+        "entry": "buy_stop_first_touch",      # resting buy-stop at rim + $0.01, first touch
         "stop": "handle_low",                 # YOUR spec: lowest low between left & right lip of the handle
         "target": "measured_move",            # cup height projected up from the breakout (primary target)
         # R (risk unit) = entry_price - handle_low.  All P/L expressed in R.
 
-        # PATH capture — this is what powers the "hold 1h vs 3h vs cut" research:
-        "hold_checkpoints_min": [60, 120, 180, 240],   # record P/L (in R) at 1/2/3/4 hours
-        "max_hold_min": 240,                  # 4-hour hard cap (clock time)
-        "max_hold_bars": 240,                 # detector hold cap in BARS (=240 on 1-min; scale per timeframe)
-        "record_mfe": True,                   # max favorable excursion (in R) and the minute it occurred
-        "record_mae": True,                   # max adverse excursion
-        "slippage_bps": 2,
-        "commission_bps": 0.5,
+        "max_hold_bars": 240,                 # detector hold cap in BARS (only binds on the finest tfs;
+                                              # 15:49 EOD is the real exit for everything else)
     },
 
     # ============ BASELINE (benchmark, NOT a trade gate) ============

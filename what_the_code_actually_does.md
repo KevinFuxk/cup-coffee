@@ -1,5 +1,14 @@
 # What the Code Actually Does
 
+> **⚡ THE PIVOT (2026-09-02):** the research program this map audited — company-style rules
+> on a screened gapper universe — is **CLOSED** (verdicts in §7 stand as reference). The
+> program is now **15-second cup-and-handle + 1-minute high tight flag**, on a manually fed
+> news-source universe (The FLY / CNBC / MarketChameleon / Stocktwits), archived daily to
+> `data/watchlists/`. Rule changes: cup/handle **upper bar caps removed** (min 15/4 stay;
+> the session is the only bound); HTF timeframe 5min → 1min (rules untouched). The old
+> `archive/` was deleted on request (recoverable from git history). §§2-7 below describe
+> the audited system and remain correct for it; the caps rows are updated.
+
 *A ground-truth map of the Cup Coffee system: data flow, every parameter, every implicit
 assumption. Written 2026-08-24 from the source itself, not from intentions. Where the config
 file SAYS one thing and the code DOES another, this document records what the code does.
@@ -112,15 +121,14 @@ fossil of the pre-2026-06-11 handle definition. Documented, kept for config comp
 
 | Parameter | Value | Meaning |
 |---|---|---|
-| `cup_min_bars` / `cup_max_bars` | 15 / 60 | cup length in bars, rim to rim |
+| `cup_min_bars` / `cup_max_bars` | 15 / **None** | cup ≥15 bars; upper cap removed 2026-09-02 |
 | `right_rim_recovery_frac` | 0.25 | reused twice: the rim band (gate 4) AND the symmetry tolerance (gate 7) |
 | `rim_symmetry` | "max" | loose symmetry (live); "min" = strict variant, compare-only |
 | `rolling_rim` | True | THE rim definition (user decision 2026-07-20) |
 | `handle_min_bars` | 4 | entry forbidden before handle bar 4 |
-| `handle_max_bars` | 60 | give up if no breakout within 60 handle bars |
+| `handle_max_bars` | **None** | no age limit (2026-09-02) — a handle dies only by depth or session end |
 | `handle_max_depth_frac` | 0.20 | handle ≤ 20% of cup (the "5:1" rule) |
 | `entry_offset_dollars` | 0.01 | buy-stop = rim + $0.01 |
-| `handle_ratchet_bars` | 4 | **DEAD** — never referenced after init |
 | `labeling.max_hold_bars` | 240 | hold cap in **bars**, not minutes (see §6.5) |
 
 ### Live bot (live_trader_ibkr.py CLI — defaults)

@@ -46,7 +46,7 @@ def gates(det: PatternDetector, b: Bars, minstop: float):
         while True:
             cup = det._find_cup(b, li, min_ri)
             if cup is None:
-                bump("no valid right rim (±25% band / rim-line / 15-60 bars)")
+                bump("no valid right rim (±25% band / rim-line / >=15 bars)")
                 break
             bot_i, ri = cup
             cup_low = b.l[bot_i]
@@ -64,7 +64,7 @@ def gates(det: PatternDetector, b: Bars, minstop: float):
             trig = rim + det.entry_off
             earliest = max(ri + det.h_min - 1, ri + 2)
             hl, outcome = float("inf"), None
-            for k in range(ri + 1, min(n, ri + det.h_max)):
+            for k in range(ri + 1, min(n, ri + det.h_max) if det.h_max else n):
                 if k >= earliest and hl < float("inf") and b.h[k] >= trig:
                     sp = (trig - hl) / trig * 100
                     if sp < minstop:

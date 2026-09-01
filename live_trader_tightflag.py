@@ -68,7 +68,7 @@ import os, sys, argparse, csv
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
-from pattern_detector_tightflag import (CONFIG, detect, prev_close_gate, r_unit_for,
+from pattern_detector_tightflag import (CONFIG, cfg_width, detect, prev_close_gate, r_unit_for,
                                         entry_fill)
 from data_layer import Bars
 
@@ -94,10 +94,12 @@ DEFAULT_SYMS = ["QQQ"]                 # user's preferred test symbol (2026-07-2
 # ----------------------------------------------------------------------------
 
 class Clock5:
-    """1-min bars in -> closed clock-aligned 5-min bars out (windows anchored to
-    09:30). Emits a bar only when the window is COMPLETE (a later window opened),
-    so nothing downstream ever sees a partial bar — that is what keeps the live
-    path faithful to the backtest."""
+    """1-min bars in -> closed clock-aligned setup bars out (window width comes
+    from CONFIG["timeframe"] — 1 minute since the 2026-09-02 decision; windows
+    anchored to 09:30). Emits a bar only when the window is COMPLETE (a later
+    window opened), so nothing downstream ever sees a partial bar — that is what
+    keeps the live path faithful to the backtest."""
+    WIDTH = None                                     # resolved from CONFIG at import (below)
     def __init__(self, sink):
         self.sink = sink
         self.k = None
@@ -110,7 +112,7 @@ class Clock5:
         mod = t.hour * 60 + t.minute
         if mod < 9 * 60 + 30 or mod >= 16 * 60:
             return
-        k = (mod - (9 * 60 + 30)) // 5
+        k = (mod - (9 * 60 + 30)) // self.WIDTH
         if self.k is None:
             self._start(k, t, o, h, l, c, v)
             return
@@ -122,7 +124,7 @@ class Clock5:
         self._start(k, t, o, h, l, c, v)
 
     def _start(self, k, t, o, h, l, c, v):
-        start = 9 * 60 + 30 + 5 * k
+        start = 9 * 60 + 30 + self.WIDTH * k
         self.k, self.o, self.h, self.l, self.c, self.v, self.n = k, o, h, l, c, v, 1
         self.ts = t.replace(hour=start // 60, minute=start % 60, second=0, microsecond=0)
 
@@ -138,6 +140,9 @@ class Clock5:
 # ----------------------------------------------------------------------------
 # the bot
 # ----------------------------------------------------------------------------
+
+
+Clock5.WIDTH = cfg_width(CONFIG)   # 1 since 2026-09-02 — single source of truth
 
 class TightFlagTrader:
     RUN_MODE = "shadow"          # set per run: shadow | armed | replay | cache
@@ -481,7 +486,7 @@ class TightFlagTrader:
             self.say(f"  · {sym} no trade — missing an opening bar")
             return
         b0, b1 = B[0], B[1]
-        five = Bars(sym, self.day, "5min", [b0["ts"], b1["ts"]],
+        five = Bars(sym, self.day, CONFIG["timeframe"], [b0["ts"], b1["ts"]],
                     [b0["o"], b1["o"]], [b0["h"], b1["h"]], [b0["l"], b1["l"]],
                     [b0["c"], b1["c"]], [b0["v"], b1["v"]], True)
         setup, why = detect(five, [0, 1], [b0["cov"], b1["cov"]], self.cfg)
@@ -733,7 +738,7 @@ def cache_replay(a, syms):
             mod = dt.hour*60 + dt.minute
             if mod < 570 or mod >= 960:
                 continue
-            k = (mod - 570)//5
+            k = (mod - 570)//Clock5.WIDTH
             if k in seen:                              # same window -> merge (as the scanner does)
                 b = seen[k]
                 b["h"] = max(b["h"], r["h"]); b["l"] = min(b["l"], r["l"])
@@ -742,7 +747,7 @@ def cache_replay(a, syms):
             seen[k] = dict(ts=dt, o=r["o"], h=r["h"], l=r["l"], c=r["c"], v=r["v"])
         for k in sorted(seen):
             b = seen[k]
-            bot.on_5min(sym, k, b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"], 5)
+            bot.on_5min(sym, k, b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"], Clock5.WIDTH)
         bot.eod(datetime.combine(bot.day, EOD))
 
 

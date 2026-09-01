@@ -29,5 +29,3 @@ data/idx_multitf.json
 data/*.superseded
 # editor + local backups + shell accidents
 .vscode/
-*.bak-*
-archive/junk/
