@@ -57,6 +57,38 @@ def build_html():
     cards = "".join(
         f"<div class='card'><h3>{v}</h3><p>{stats([r for r in rows if r['variant'] == v])}</p></div>"
         for v in variants)
+
+    # ---- universe join: sources, overlap-alpha, recorded drops (pivot 2026-09-02) ----
+    upanel = ""
+    if os.path.exists("data/universe_log.csv"):
+        uni = list(csv.DictReader(open("data/universe_log.csv")))
+        usrc = {(u["day"], u["symbol"]): u for u in uni}
+        live = [r for r in rows if r["variant"] == "minstop=0.25"]
+        grp = {"overlap (2+ sources)": [], "single source": [], "unlogged day": []}
+        for r in live:
+            u = usrc.get((r["session"], r["symbol"]))
+            key = ("unlogged day" if u is None else
+                   "overlap (2+ sources)" if int(u["n_sources"]) >= 2 else "single source")
+            grp[key].append(float(r["R"]))
+        ostat = ""
+        for g, xs in grp.items():
+            if xs:
+                ostat += (f"<div class='card'><h3>{g}</h3><p><b>{len(xs)}</b> trades · "
+                          f"total <b>{sum(xs):+.2f}R</b> · avg {sum(xs)/len(xs):+.3f}R/trade</p></div>")
+        days_html = ""
+        for d in sorted({u["day"] for u in uni}, reverse=True):
+            chips = ""
+            for u in [u for u in uni if u["day"] == d]:
+                lab = f"{u['symbol']}·{u['n_sources']}src"
+                if u["qualified"] == "yes":
+                    cls = "chip hot" if int(u["n_sources"]) >= 2 else "chip"
+                    chips += f"<span class='{cls}' title='{u['sources']}'>{lab}</span>"
+                else:
+                    chips += (f"<span class='chip drop' title='{u['reason']}'>"
+                              f"{lab} 🚫</span>")
+            days_html += f"<p><b>{d}</b> &nbsp;{chips}</p>"
+        upanel = (f"<h2>Overlap alpha (minstop=0.25)</h2><div class='cards'>{ostat}</div>"
+                  f"<h2>Daily universe — every ticker, drops with reasons (hover)</h2>{days_html}")
     head = "".join(f"<th>{c}</th>" for c in
                    ["session", "variant", "symbol", "tf", "entry time", "entry", "trigger",
                     "stop", "stop %", "exit time", "exit", "@ price", "R", "peak R"])
@@ -83,12 +115,17 @@ def build_html():
  th,td{{border-bottom:1px solid #eee;padding:5px 8px;text-align:right}}
  th{{background:#f5f5f5;position:sticky;top:0}} td:nth-child(-n+5),th:nth-child(-n+5){{text-align:left}}
  .pos{{color:#0a7d33;font-weight:600}} .neg{{color:#c22;font-weight:600}}
+ h2{{font-size:16px;margin:22px 0 8px}}
+ .chip{{display:inline-block;border:1px solid #ccc;border-radius:10px;padding:1px 8px;
+        margin:2px;font-size:12px;background:#fff}}
+ .chip.hot{{border-color:#0a7d33;background:#eafbee;font-weight:600}}
+ .chip.drop{{border-color:#c22;background:#fdeeee;color:#933;text-decoration:line-through}}
 </style>
 <h1>Cup &amp; Handle — daily replay trade ledger</h1>
 <div class="cards">{cards}</div>
 filter: <select id="fv" onchange="F()"><option>all variants</option>{vopts}</select>
 <select id="fs" onchange="F()"><option>all sessions</option>{sopts}</select>
-<table><thead><tr>{head}</tr></thead><tbody id="tb">{body}</tbody></table>
+{upanel}\n<h2>All recorded trades</h2>\n<table><thead><tr>{head}</tr></thead><tbody id="tb">{body}</tbody></table>
 <script>
 function F(){{const v=fv.value,s=fs.value;for(const r of tb.rows)
  r.style.display=((v.startsWith('all')||r.dataset.v===v)&&(s.startsWith('all')||r.dataset.s===s))?'':'none';}}
