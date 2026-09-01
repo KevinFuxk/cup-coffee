@@ -50,7 +50,8 @@ from data_layer import Bars
 
 ET = ZoneInfo("America/New_York")
 DEFAULT_SYMS = ["SPY","QQQ"]
-DEFAULT_TFS = "1min,2min,5min"     # 1/2/5 = backtested pile; 3min = user's call, backfill pending
+DEFAULT_TFS = "15s"                # THE PROGRAM (2026-09-02): 15-second cup-and-handle, forward test.
+                                   # legacy minute mode still works: --tfs 1min,2min,5min
 BACKTESTED_TFS = {"1min", "2min", "5min"}
 EOD = dtime(15, 49)
 LIVE_PORTS = {4001, 7496}
@@ -141,6 +142,10 @@ def archive_watchlist(path: str | None) -> None:
     (source ###SECTION tags preserved verbatim). Idempotent: the newest export
     of the day wins; tiny text files, committed to git for free backup."""
     if not path or not os.path.exists(path):
+        return
+    if datetime.fromtimestamp(os.path.getmtime(path), ET).date() != datetime.now(ET).date():
+        print("  📚 watchlist NOT archived — the export is from an earlier day (a stale list "
+              "must never enter the point-in-time log; re-export from TradingView)")
         return
     os.makedirs("data/watchlists", exist_ok=True)
     dst = f"data/watchlists/{datetime.now(ET):%Y-%m-%d}.txt"
@@ -265,8 +270,9 @@ class TickBarBuilder:
 
 
 class Trader:
-    def __init__(self, ib, Order, MarketOrder, args, agg_ks):
+    def __init__(self, ib, Order, MarketOrder, args, agg_ks, base_tf="1min"):
         self.ib, self.Order, self.MarketOrder, self.a = ib, Order, MarketOrder, args
+        self.base_tf = base_tf                         # "15s" (the program) or "1min" (legacy)
         self.det = PatternDetector(CONFIG)
         self.agg_ks = agg_ks                           # e.g. [2, 5]
         self.aggs: dict[tuple, MinuteAggregator] = {}  # (sym, k) -> aggregator
@@ -371,7 +377,7 @@ class Trader:
         if rows:
             L.append(f"  {'sym':<7}{'tf':<6}{'entry':>10}{'stop':>10}{'take-profit':>13}{'last':>10}{'uP&L':>9}")
             for sym, tf, entry, stop, target, trig in rows:
-                B = self.store.get((sym, "1min"))
+                B = self.store.get((sym, self.base_tf))
                 last = B.c[-1] if B and len(B) else entry
                 risk = trig - stop
                 ur = (last - entry) / risk if risk > 0 else 0.0
@@ -611,10 +617,10 @@ class Trader:
         if B.ts and t <= B.ts[-1]:
             return False                               # already ingested (reconnect replays)
         B.ts.append(t); B.o.append(o); B.h.append(h); B.l.append(l); B.c.append(c); B.v.append(v)
-        if tf == "1min" and t.date() != self.cur_day:  # new session -> re-open the trading day
+        if tf == self.base_tf and t.date() != self.cur_day:   # new session -> re-open the trading day
             self.cur_day = t.date()
             self.eod_done = False
-        if self._report and tf == "1min":              # proof-of-life: silence must never be ambiguous
+        if self._report and tf == self.base_tf:        # proof-of-life: silence must never be ambiguous
             self._last_t = t
             if not self.live_started:
                 self.live_started = True
@@ -693,12 +699,12 @@ class Trader:
         return True
 
     def feed_1min(self, sym, t, o, h, l, c, v):
-        """ONE closed 1-min bar from ANY source (historical seed, stream, or tick-built) ->
-        the 1min pipeline, then the local 2/3/5min aggregators (their closed buckets run
-        their own pipelines). Duplicates are dropped so sources can safely overlap."""
+        """ONE closed BASE bar (15s in the program / 1min legacy) from ANY source ->
+        the base pipeline, then (minute base only) the local k-min aggregators.
+        Duplicates are dropped so sources can safely overlap."""
         if not (dtime(9, 30) <= t.time() <= dtime(16, 0)):
             return
-        if not self.on_closed_bar(sym, "1min", t, o, h, l, c, v):
+        if not self.on_closed_bar(sym, self.base_tf, t, o, h, l, c, v):
             return                                     # duplicate -> don't double-feed the aggregators
         for k in self.agg_ks:
             agg = self.aggs.get((sym, k))
@@ -758,13 +764,23 @@ def main():
         sys.exit("✗ --replay with --arm makes no sense (orders on already-finished bars). Replay is shadow-only.")
     syms, src = read_watchlist(a.symbols, a.watchlist)
     tfs = [t.strip() for t in a.tfs.split(",")]
-    if "1min" not in tfs:
-        sys.exit("✗ --tfs must include 1min (it is the base stream the others are built from).")
-    try:
-        agg_ks = sorted({int(t[:-3]) for t in tfs if t != "1min"})
-        assert all(t.endswith("min") and int(t[:-3]) > 0 for t in tfs)
-    except (ValueError, AssertionError):
-        sys.exit(f"✗ bad --tfs '{a.tfs}' — use e.g. 1min,2min,5min")
+    if tfs == ["15s"]:
+        # THE PROGRAM: base stream = native IBKR 15-sec bars (probe 2026-08-31: history
+        # serves >=200 days of full 1,560-bar sessions, keepUpToDate attaches).
+        base_tf, bar_size, seed_dur, agg_ks = "15s", "15 secs", "2 D", []
+        if a.delayed:
+            sys.exit("✗ 15s needs the real-time subscription — the delayed tier cannot serve it.")
+    elif "15s" in tfs:
+        sys.exit("✗ 15s runs alone (no cross-aggregation from a 15s base yet).")
+    else:
+        if "1min" not in tfs:
+            sys.exit("✗ --tfs must include 1min (it is the base stream the others are built from).")
+        try:
+            agg_ks = sorted({int(t[:-3]) for t in tfs if t != "1min"})
+            assert all(t.endswith("min") and int(t[:-3]) > 0 for t in tfs)
+        except (ValueError, AssertionError):
+            sys.exit(f"✗ bad --tfs '{a.tfs}' — use e.g. 1min,2min,5min or just 15s")
+        base_tf, bar_size, seed_dur = "1min", "1 min", "5 D"
     for t in tfs:
         if t not in BACKTESTED_TFS:
             print(f"⚠️ {t} was NEVER BACKTESTED — no evidence it has an edge. Backfill + label a {t} "
@@ -783,7 +799,7 @@ def main():
     ib.reqMarketDataType(3 if a.delayed else 1)
     ib.sleep(1)
 
-    bot = Trader(ib, Order, MarketOrder, a, agg_ks)
+    bot = Trader(ib, Order, MarketOrder, a, agg_ks, base_tf=base_tf)
     mode = "🔴 ARMED — placing PAPER orders" if a.arm else "🟢 SHADOW — logging only, no orders"
     print(f"ORDER ROBOT — IBKR paper — {mode}")
     print(f"  PRE-ARM entries: brackets REST during the handle (backtest-faithful first-touch fills)")
@@ -825,7 +841,7 @@ def main():
         # 5 D lookback, NOT 1 D: the window must ALWAYS contain >=1 trading session (holiday
         # weekends!). NOTE: on the free DELAYED tier this returns COMPLETED sessions only —
         # today's bars are invisible until the close; tick-mode below covers today.
-        bl = ib.reqHistoricalData(c, endDateTime="", durationStr="5 D", barSizeSetting="1 min",
+        bl = ib.reqHistoricalData(c, endDateTime="", durationStr=seed_dur, barSizeSetting=bar_size,
                                   whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=stream)
         feed = bl
         if a.replay and len(bl):                       # replay ONLY the most recent session in the window
@@ -846,7 +862,7 @@ def main():
         sys.exit("✗ no tradable symbols left — check data/watchlist.txt")
 
     if a.replay:
-        rlatest = max((B.ts[-1] for (s, t), B in bot.store.items() if t == "1min" and len(B)), default=None)
+        rlatest = max((B.ts[-1] for (s, t), B in bot.store.items() if t == base_tf and len(B)), default=None)
         rday = f"{rlatest:%A %Y-%m-%d}" if rlatest else "?"
         print(f"\n▶️ REPLAY complete — session replayed: {rday}. Every 🛡️/🔧/💥/🗑️/📋 above is what "
               f"live would have printed on that day. Compare charts against THAT date. No stream started.")
@@ -893,7 +909,7 @@ def main():
         return
 
     today = datetime.now(ET).date()
-    latest = max((B.ts[-1] for (s, t), B in bot.store.items() if t == "1min" and len(B)), default=None)
+    latest = max((B.ts[-1] for (s, t), B in bot.store.items() if t == base_tf and len(B)), default=None)
     tickmode = a.delayed and (latest is None or latest.date() < today)
     if tickmode:
         # today is invisible to delayed HISTORICAL -> build today's 1min bars from delayed TICKS.
@@ -935,7 +951,7 @@ def main():
                 ib.sleep(poll_iv)
                 for s in syms:
                     pl = ib.reqHistoricalData(bot.contracts[s], endDateTime="", durationStr="1 D",
-                                              barSizeSetting="1 min", whatToShow="TRADES",
+                                              barSizeSetting=bar_size, whatToShow="TRADES",
                                               useRTH=True, formatDate=2, keepUpToDate=False)
                     bot.ingest(s, pl, report=True)
         else:

@@ -108,8 +108,13 @@ CONFIG = {
     "fly_by_bar": 4,              #   excursion hits fly_trigger_R during clock bars 3-4
     "trail_from_bar": 4,          # first stop move at the CLOSE of this bar (1-based)
     "trail_lag_bars": 2,          # stop -> prev printed bar's low/high (2 behind the forming bar)
-    "trigger_bar": 2,             # USER 2026-07-28: the stop-entry may only fire during
-                                  #   clock bucket 2 = BAR 3 (09:40-09:45). Never after.
+    "trigger_bar": 2,             # first bucket the stop-entry may fire in (bar 3 —
+                                  #   the setup needs bars 1+2 complete first)
+    "entry_deadline_min": 15,     # USER 2026-09-02: the entry may trigger any time from
+                                  #   bar 3 up to 09:45 ET, NEVER after. (On the legacy
+                                  #   5-min width this reproduces the old bar-3-only rule
+                                  #   exactly: bucket 2 = 09:40-09:45 is the last one
+                                  #   starting before minute 15.)
     "eod_flat": "15:49",          # shared intraday session rule
     # USER CORRECTION 2026-07-28: R is the ENTRY-TO-STOP distance — the risk actually
     # taken, which depends on the quality of the fill. (The original spec said bar 2's
@@ -375,36 +380,31 @@ def label_trail(five: Bars, buckets: list[int], entry_price: float,
 
 def entry_fill(five: Bars, buckets: list[int], setup: dict,
                cfg: dict = CONFIG) -> Optional[tuple]:
-    """Resting STOP-entry at setup['entry_level'], triggerable during BAR 3 only
-    (clock bucket 2 = 09:40-09:45), a TOUCH being enough (USER 2026-07-28).
+    """Resting STOP-entry at setup['entry_level'], triggerable from bar 3 (bucket
+    `trigger_bar`) through the last bucket starting before `entry_deadline_min`
+    after the open — 09:45 ET (USER 2026-09-02). A TOUCH is enough. Never after.
 
     Returns (fill_price, fill_ts, delay_min) or None if it never triggered.
-    Fill convention (same as the cup harness): if bar 3 OPENS already through the
-    level the market gapped past the order, so it fills at that open — worse than
-    the level, which is the honest outcome. Otherwise it fills AT the level."""
-    trigger_bar = cfg.get("trigger_bar", 2)            # clock bucket of bar 3
-    i = next((j for j, k in enumerate(buckets) if k == trigger_bar), None)
-    if i is None:
-        return None                                    # bar 3 never printed
+    Fill convention (same as the cup harness): a bucket that OPENS already
+    through the level means the market gapped past the resting order — it fills
+    at that open, worse than the level. Otherwise it fills AT the level."""
+    trigger_bar = cfg.get("trigger_bar", 2)
+    deadline = cfg.get("entry_deadline_min", 15)
+    width = cfg_width(cfg)
     lvl = setup["entry_level"]
     lng = setup["side"] == "long"
-    o, h, l = five.o[i], five.h[i], five.l[i]
-    if lng:
-        if o >= lvl:
-            px = o                                     # gapped through the buy-stop
-        elif h >= lvl:
-            px = lvl
+    for i, k in enumerate(buckets):
+        if k < trigger_bar or k * width >= deadline:   # before bar 3 / at-or-after 09:45
+            continue
+        o, h, l = five.o[i], five.h[i], five.l[i]
+        if lng:
+            px = o if o >= lvl else (lvl if h >= lvl else None)
         else:
-            return None                                # never reached -> no trade
-    else:
-        if o <= lvl:
-            px = o                                     # gapped through the sell-stop
-        elif l <= lvl:
-            px = lvl
-        else:
-            return None
-    ts = five.ts[i]
-    return px, ts, (ts.hour * 60 + ts.minute) - (9 * 60 + 40)
+            px = o if o <= lvl else (lvl if l <= lvl else None)
+        if px is not None:
+            ts = five.ts[i]
+            return px, ts, (ts.hour * 60 + ts.minute) - (9 * 60 + 30 + trigger_bar * width)
+    return None                                        # never reached before 09:45 -> no trade
 
 
 def r_unit_for(entry: float, stop: float, range2: float, cfg: dict = CONFIG) -> float:

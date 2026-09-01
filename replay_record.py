@@ -24,7 +24,7 @@ LEDGER, HTML = "data/replay_trades.csv", "data/replay_trades.html"
 
 
 def run_replays():
-    base = [PY, "live_trader_ibkr.py", "--delayed", "--replay", "--port", "4002", "--client-id", "9"]
+    base = [PY, "live_trader_ibkr.py", "--replay", "--tfs", "15s", "--port", "4002", "--client-id", "9"]
     for ms in ("0.25", "0"):
         print(f"=== replay with min-stop {ms}% ===", flush=True)
         r = subprocess.run(base + ["--minstop", ms], capture_output=True, text=True)
@@ -105,7 +105,16 @@ def explain():
     print(out if out else "  (explain_day.py produced no output — is IB Gateway running?)")
 
 
+def cache_bars():
+    """Accumulate the private 15s story-stock dataset — the data money can't buy."""
+    print("=" * 70)
+    r = subprocess.run([PY, "cache_15s.py"], capture_output=True, text=True)
+    for l in r.stdout.splitlines()[-6:]:
+        print(l)
+
+
 if __name__ == "__main__":
     run_replays()
     build_html()
+    cache_bars()
     explain()

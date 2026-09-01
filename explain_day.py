@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from cup_coffee_config_v2 import CONFIG
 from data_layer import Bars
-from live_trader_ibkr import MinuteAggregator, read_watchlist
+from live_trader_ibkr import read_watchlist
 from pattern_detector import PatternDetector, _is_peak
 
 ET = ZoneInfo("America/New_York")
@@ -122,7 +122,7 @@ def main():
         c = Stock(sym, "SMART", "USD")
         try:
             ib.qualifyContracts(c)
-            bl = ib.reqHistoricalData(c, endDateTime="", durationStr="3 D", barSizeSetting="1 min",
+            bl = ib.reqHistoricalData(c, endDateTime="", durationStr="2 D", barSizeSetting="15 secs",
                                       whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=False)
         except Exception as e:
             print(f"{sym}: data unavailable ({type(e).__name__})\n")
@@ -132,7 +132,7 @@ def main():
             continue
         D = Date.fromisoformat(day) if day else max(
             x.date.astimezone(ET).date() if hasattr(x.date, "astimezone") else x.date.date() for x in bl)
-        b1 = Bars(symbol=sym, date=D, timeframe="1min", ts=[], o=[], h=[], l=[], c=[], v=[])
+        b1 = Bars(symbol=sym, date=D, timeframe="15s", ts=[], o=[], h=[], l=[], c=[], v=[])
         for x in bl:
             t = x.date.astimezone(ET).replace(tzinfo=None) if hasattr(x.date, "astimezone") else x.date
             if t.date() == D and dtime(9, 30) <= t.time() <= dtime(15, 59):
@@ -143,17 +143,9 @@ def main():
             continue
 
         rng = (max(b1.h) - min(b1.l)) / min(b1.l) * 100
-        print(f"── {sym}  {D}  ({len(b1)} 1-min bars, {rng:.1f}% intraday range) ──")
+        print(f"── {sym}  {D}  ({len(b1)} 15s bars, {rng:.1f}% intraday range) ──")
         any_entry = False
-        for tf, k in (("1min", 1), ("2min", 2), ("5min", 5)):
-            b = b1
-            if k > 1:
-                b = Bars(symbol=sym, date=D, timeframe=tf, ts=[], o=[], h=[], l=[], c=[], v=[])
-                agg = MinuteAggregator(k, lambda ts, o, h, l, cc, v: (
-                    b.ts.append(ts), b.o.append(o), b.h.append(h), b.l.append(l), b.c.append(cc), b.v.append(v)))
-                for i in range(len(b1)):
-                    agg.add(b1.ts[i], b1.o[i], b1.h[i], b1.l[i], b1.c[i], b1.v[i])
-                agg._flush()
+        for tf, b in (("15s", b1),):                  # THE PROGRAM: 15-second cup-and-handle
             if len(b) < det.cup_min + det.h_min + 2:
                 continue
             reasons, near, entries, rolls = gates(det, b, MINSTOP)

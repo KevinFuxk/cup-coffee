@@ -418,19 +418,23 @@ class TightFlagTrader:
         if not st:
             return
 
-        # ---- resolve the resting STOP-ENTRY (bar 3 only, USER 2026-07-28) ----
-        if not st.get("open") and k == self.cfg.get("trigger_bar", 2):
+        # ---- resolve the resting STOP-ENTRY (bar 3 .. 09:45, USER 2026-09-02) ----
+        _w = Clock5.WIDTH
+        _dead = self.cfg.get("entry_deadline_min", 15)
+        if (not st.get("open") and k >= self.cfg.get("trigger_bar", 2)
+                and k * _w < _dead):
             lvl, lng = st["entry_level"], st["side"] == "long"
             if lng:
                 px = o if o >= lvl else (lvl if h >= lvl else None)
             else:
                 px = o if o <= lvl else (lvl if l <= lvl else None)
             if px is None:
-                self.done[sym] = True
-                self.state.pop(sym, None)
-                self.cancel_my_stop(sym)               # pull the unfilled entry order
-                self.say(f"  · {sym} no trade — bar 3 never reached ${lvl:.2f} (no_trigger)")
-                return
+                if (k + 1) * _w >= _dead:              # that was the last eligible bucket
+                    self.done[sym] = True
+                    self.state.pop(sym, None)
+                    self.cancel_my_stop(sym)           # pull the unfilled entry order
+                    self.say(f"  · {sym} no trade — never reached ${lvl:.2f} by 09:45 (no_trigger)")
+                return                                 # else: keep resting into the next bar
             self._open_trade(sym, st, px, ts)
             # fall through: this same bar 3 is also managed (stop-first convention)
 
