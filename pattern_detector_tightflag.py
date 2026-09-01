@@ -284,7 +284,7 @@ def detect(five: Bars, buckets: list[int], cov: list[int],
 
 def label_trail(five: Bars, buckets: list[int], entry_price: float,
                 stop0: float, r_unit: float, side: str = "long",
-                cfg: dict = CONFIG) -> dict:
+                cfg: dict = CONFIG, entry_bucket: int | None = None) -> dict:
     """Walk the 5-min bars from the entry bar (clock bar 3) to 15:49.
     The stop active DURING bar N is the one set by the close of bar N-1.
     FLY TRIGGER (USER 2026-07-25): trailing is armed only if the favorable
@@ -297,8 +297,9 @@ def label_trail(five: Bars, buckets: list[int], entry_price: float,
              the previous printed bar.
     trail_lag_bars = 2 -> the reference bar is 2 behind the bar now forming."""
     lng = side == "long"
+    start = entry_bucket if entry_bucket is not None else cfg.get("trigger_bar", 2)
     idxs = [i for i in range(len(five))
-            if buckets[i] >= 2 and five.ts[i].time() <= _EOD_T]
+            if buckets[i] >= start and five.ts[i].time() <= _EOD_T]
     stop = stop0
     trail_moves = 0
     trail_path: list[list] = []
@@ -330,7 +331,14 @@ def label_trail(five: Bars, buckets: list[int], entry_price: float,
         hit = (five.l[i] <= stop) if lng else (five.h[i] >= stop)
         if hit:                                     # stop first (conservative)
             exit_i = i
-            exit_price = (min(stop, five.o[i]) if lng else max(stop, five.o[i]))
+            if n == 0:
+                # THE FILL BAR: the bar's open happened BEFORE our entry existed, so
+                # "gapped through at the open" cannot apply — a same-bar stop-out
+                # fills at the stop level. (Caught on GAP 2026-08-28: entry 25.40,
+                # stop 25.12, and the pre-fix code booked the 24.91 OPEN = -1.75R.)
+                exit_price = stop
+            else:
+                exit_price = (min(stop, five.o[i]) if lng else max(stop, five.o[i]))
             exit_reason = "stop"                    # gap through -> the open
             break
         # survived the bar -> arm the fly if +1.75R was reached in bars 3-4
@@ -384,7 +392,11 @@ def entry_fill(five: Bars, buckets: list[int], setup: dict,
     `trigger_bar`) through the last bucket starting before `entry_deadline_min`
     after the open — 09:45 ET (USER 2026-09-02). A TOUCH is enough. Never after.
 
-    Returns (fill_price, fill_ts, delay_min) or None if it never triggered.
+    Returns (fill_price, fill_ts, delay_min, fill_bucket) or None if it never
+    triggered — fill_bucket is where the exit walk must START: with the widened
+    entry window a fill can happen well after bar 3, and walking from bar 3
+    would manage bars BEFORE the position existed (exit-before-entry bug,
+    caught on the 2026-08-28 backfill: GAP entry 09:34 "exited" 09:32).
     Fill convention (same as the cup harness): a bucket that OPENS already
     through the level means the market gapped past the resting order — it fills
     at that open, worse than the level. Otherwise it fills AT the level."""
@@ -403,7 +415,7 @@ def entry_fill(five: Bars, buckets: list[int], setup: dict,
             px = o if o <= lvl else (lvl if l <= lvl else None)
         if px is not None:
             ts = five.ts[i]
-            return px, ts, (ts.hour * 60 + ts.minute) - (9 * 60 + 30 + trigger_bar * width)
+            return px, ts, (ts.hour * 60 + ts.minute) - (9 * 60 + 30 + trigger_bar * width), k
     return None                                        # never reached before 09:45 -> no trade
 
 
@@ -455,12 +467,13 @@ def scan_day(one_min: Bars, symbol: str, day: Date,
     fill = entry_fill(five, buckets, setup, cfg)
     if fill is None:
         return None, "no_trigger"
-    entry_price, entry_ts, delay = fill
+    entry_price, entry_ts, delay, entry_bucket = fill
 
     r_unit = r_unit_for(entry_price, stop0, setup["range2"], cfg)
     if r_unit <= 0:
         return None, "zero_r_unit"
-    lab = label_trail(five, buckets, entry_price, stop0, r_unit, side, cfg)
+    lab = label_trail(five, buckets, entry_price, stop0, r_unit, side, cfg,
+                      entry_bucket=entry_bucket)
 
     e = TightFlagEvent(
         symbol=symbol, day=day, timeframe=cfg["timeframe"], side=side,

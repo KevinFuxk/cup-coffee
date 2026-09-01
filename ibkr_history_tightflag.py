@@ -318,7 +318,7 @@ def scan(args):
                     funnel["no_trigger"] += 1
                     prev_close = today_close
                     continue
-                entry_price, entry_ts, delay = fill
+                entry_price, entry_ts, delay, entry_bucket = fill
                 ent = next(i for i, k in enumerate(buckets) if k == CONFIG["trigger_bar"])
                 r_unit = r_unit_for(entry_price, stop0, setup["range2"], CONFIG)
                 if r_unit <= 0:
@@ -326,7 +326,8 @@ def scan(args):
                     prev_close = today_close
                     continue
                 lab = label_trail(five, buckets, entry_price, stop0,
-                                  r_unit, setup["side"], CONFIG)
+                                  r_unit, setup["side"], CONFIG,
+                                  entry_bucket=entry_bucket)
                 e = TightFlagEvent(
                     symbol=sym, day=day, timeframe="5min", side=setup["side"],
                     b1_o=five.o[0], b1_h=five.h[0], b1_l=five.l[0], b1_c=five.c[0], b1_v=five.v[0],

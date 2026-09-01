@@ -32,7 +32,7 @@ THE TRADE (frozen gate-(a) v3 rules, from pattern_detector_tightflag.CONFIG):
 
 COEXISTENCE with live_trader_ibkr.py (READ THIS BEFORE RUNNING BOTH):
   Safe by construction here:
-    * distinct clientId (default 21 vs the cup bot's 8) -> separate order
+    * distinct clientId (default 18 vs the cup bot's 8) -> separate order
       sequences; each API client only sees the orders it placed.
     * this bot cancels ONLY its own order handles and closes ONLY the positions
       it opened. It never calls reqGlobalCancel() and never iterates
@@ -70,6 +70,8 @@ from zoneinfo import ZoneInfo
 
 from pattern_detector_tightflag import (CONFIG, cfg_width, detect, prev_close_gate, r_unit_for,
                                         entry_fill)
+from live_trader_ibkr import read_watchlist   # shared TradingView-export discovery
+                                              # (import only — cup files stay read-only)
 from data_layer import Bars
 
 ET = ZoneInfo("America/New_York")
@@ -436,6 +438,8 @@ class TightFlagTrader:
                     self.say(f"  · {sym} no trade — never reached ${lvl:.2f} by 09:45 (no_trigger)")
                 return                                 # else: keep resting into the next bar
             self._open_trade(sym, st, px, ts)
+            if st.get("open"):
+                st["fill_k"] = k       # same-bar stop-outs price at the stop level
             # fall through: this same bar 3 is also managed (stop-first convention)
 
         if not st.get("open"):
@@ -453,7 +457,10 @@ class TightFlagTrader:
         st["mfe"] = max(st.get("mfe", 0.0), fav)
         hit = (l <= st["stop"]) if lng else (h >= st["stop"])
         if hit:
-            px = min(st["stop"], o) if lng else max(st["stop"], o)
+            if st.get("fill_k") == k:
+                px = st["stop"]        # same-bar stop-out: the open predates our fill
+            else:
+                px = min(st["stop"], o) if lng else max(st["stop"], o)
             self._book(sym, st, px, "STOP", ts)
             return
         barnum = k + 1
@@ -512,7 +519,7 @@ class TightFlagTrader:
                  f"bar2 range ${setup['range2']:.2f}\n"
                  f"      resting {'BUY' if setup['side']=='long' else 'SELL'}-STOP @ ${lvl:.2f}"
                  f"   stop ${stop0:.2f}   R ${abs(lvl-stop0):.2f}"
-                 f"   — valid during bar 3 (09:40-09:45) only")
+                 f"   — valid from bar 3 until 09:45")
         if self.a.arm:
             self.place_stop_entry(sym, setup["side"], lvl, stop0)
 
@@ -534,7 +541,8 @@ class TightFlagTrader:
             self.say(f"  · {sym} no trade — zero risk distance"); return
         gapped = (price > st["entry_level"] + 1e-9) if lng else (price < st["entry_level"] - 1e-9)
         qty = self.qty_for(price, stop)
-        st.update(open=True, entry=price, stop=stop, R=R, qty=qty, entry_ts=ts, late=0)
+        st.update(open=True, entry=price, stop=stop, R=R, qty=qty, entry_ts=ts,
+                  late=0, fill_k=None)
         tag = "🔴 ARMED" if self.a.arm else "🟢 shadow"
         note = f"  ⚠️ GAPPED through the order (level ${st['entry_level']:.2f})" if gapped else ""
         self.say(f"  ▶ {sym} FILLED {st['side'].upper()} {qty} @ ${price:.2f}  "
@@ -719,7 +727,12 @@ def cache_replay(a, syms):
         a.base = 100_000.0                             # nominal, so share counts are readable
 
     for sym in syms:
-        p = f"cache/ibkr5/{sym}/{a.cache_day}.json"
+        # the replay must read bars on the SAME clock the bot runs (1-min since
+        # the pivot). cache/ibkr5 is the legacy 5-min research cache — replaying it
+        # through a 1-min Clock is incoherent, so use the pivot-era dataset.
+        p = f"cache/ibkr1min_days/{sym}/{a.cache_day}.json"
+        if not os.path.exists(p) and Clock5.WIDTH == 5:
+            p = f"cache/ibkr5/{sym}/{a.cache_day}.json"   # legacy clock only
         if not os.path.exists(p):
             print(f"  ✗ no cached bars: {p}")
             continue
@@ -758,13 +771,18 @@ def cache_replay(a, syms):
 def main():
     ap = argparse.ArgumentParser(description="Tight-flag order robot (IBKR paper, shadow by default)")
     # accept BOTH styles:  "QQQ,NVDA,BA"   and   QQQ NVDA BA
-    ap.add_argument("symbols", nargs="*", default=DEFAULT_SYMS,
-                    help="tickers, space- or comma-separated (default: QQQ)")
+    ap.add_argument("symbols", nargs="*", default=[],
+                    help="tickers, space- or comma-separated. Default: the day's TradingView "
+                         "export via the shared auto-discovery (~/Downloads/*DayTrade*.txt, "
+                         "newest wins), same as the cup bot.")
+    ap.add_argument("--watchlist", default="auto",
+                    help="watchlist file path, or 'auto' (default) for the newest export")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=4002, help="Gateway paper 4002 | TWS paper 7497")
-    ap.add_argument("--client-id", type=int, default=21,
-                    help="MUST differ from the cup robot's (default 8). Two clients on the "
-                         "same id knock each other off.")
+    ap.add_argument("--client-id", type=int, default=18,
+                    help="Daily-program assignment: 18 = HTF live (cup live=8, cup replay=9, "
+                         "HTF record/replay=19, HTF cache=20, cup tools=51-53). Two clients "
+                         "on the same id knock each other off.")
     ap.add_argument("--arm", action="store_true", help="place PAPER orders (default: shadow)")
     ap.add_argument("--risk", type=float, default=0.0025,
                     help="risk fraction of equity per trade (default 0.25%%: this strategy's "
@@ -801,9 +819,9 @@ def main():
                  "  different trade than the one backtested. Use the real-time feed to arm.")
 
     raw = a.symbols if isinstance(a.symbols, list) else [a.symbols]
-    syms = [t.strip().upper() for chunk in raw for t in str(chunk).split(",") if t.strip()]
-    seen_s = set()
-    syms = [s for s in syms if not (s in seen_s or seen_s.add(s))]      # de-dup, keep order
+    cli = ",".join(str(chunk) for chunk in raw) if raw else None
+    syms, wl_where = read_watchlist(cli, a.watchlist)
+    print(f"  symbols from: {wl_where}")
     if not syms:
         syms = list(DEFAULT_SYMS)
 
