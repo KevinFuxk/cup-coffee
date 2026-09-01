@@ -262,6 +262,7 @@ def _mini_trader(replay: bool):
                   tp=6.0, max_positions=5)
     tr = Trader(DummyIB(), None, None, a, agg_ks=[])
     tr._report = True
+    tr.log_path = "/dev/null"          # tests must NEVER write into the real live logs
     return tr
 
 
