@@ -457,6 +457,13 @@ class Trader:
                     o.lmtPrice = pend["target"]
                 o.transmit = True
                 self.ib.placeOrder(tr.contract, o)
+            # AUDIT FIND 2026-09-01: the DUOL stop modify (156.54 -> 156.51) never took
+            # effect at IBKR while the quantity did. Read the echo back and say so.
+            self.ib.sleep(1)
+            sl = pend["trades"].get("SL")
+            if sl is not None and abs(float(sl.order.auxPrice or 0) - pend["stop"]) > 0.005:
+                self._say(f"  🚨 stop modify NOT applied at IBKR: server holds ${sl.order.auxPrice} "
+                          f"(wanted ${pend['stop']:.2f}) — risk differs from the ledger")
         except Exception as ex:
             self._say(f"  ⚠️ modify failed for {pend['ref']}: {ex}")
 
@@ -593,13 +600,39 @@ class Trader:
                 r = (px - p["entry"]) / risk if risk > 0 else 0.0
                 self.closed.append(dict(ts=now, sym=p["sym"], tf=p["tf"], kind="EOD", exit=px, r=r))
             self.open_real = {}
-        n = 0
+        # AUDIT FIND 2026-09-01: ib.positions() hands back the LISTING exchange
+        # (e.g. 'NASDAQ'), which is not an order route — placing on that contract is
+        # rejected by IBKR, silently, and the position survives overnight with its
+        # protective stop already cancelled above. Always route the close via SMART,
+        # and never trust a flatten that IBKR has not confirmed.
+        closes = []
         for p in self.ib.positions():
-            if p.position != 0:
-                act = "SELL" if p.position > 0 else "BUY"
-                self.ib.placeOrder(p.contract, self.MarketOrder(act, abs(p.position)))
-                n += 1
+            if p.position == 0:
+                continue
+            sym = p.contract.symbol
+            c = self.contracts.get(sym)
+            if c is None:                              # another robot's position: still close it, routed
+                from ib_async import Stock
+                c = Stock(sym, "SMART", "USD")
+                try:
+                    self.ib.qualifyContracts(c)
+                except Exception:
+                    pass
+            act = "SELL" if p.position > 0 else "BUY"
+            tr = self.ib.placeOrder(c, self.MarketOrder(act, abs(p.position)))
+            closes.append((sym, p.position, tr))
+        n = len(closes)
         self._say(f"  ⛔ FLATTEN ({reason}) — cancelled all orders (incl. pendings), closing {n} position(s)")
+        if closes:                                     # a flatten is only real once confirmed
+            self.ib.sleep(3)
+            for sym, qty, tr in closes:
+                st = tr.orderStatus.status
+                why = f" — {tr.log[-1].message}" if st != "Filled" and tr.log else ""
+                self._say(f"  {'✅' if st == 'Filled' else '🚨'} close {sym} {qty:+.0f} sh: {st}{why}")
+            left = [p for p in self.ib.positions() if p.position != 0]
+            if left:
+                self._say("  🚨 STILL OPEN after flatten — CLOSE MANUALLY NOW: "
+                          + ", ".join(f"{p.contract.symbol} {p.position:+.0f}" for p in left))
 
     # ---- bar pipeline ----------------------------------------------------------
     def on_closed_bar(self, sym, tf, t, o, h, l, c, v) -> bool:
@@ -800,6 +833,18 @@ def main():
     ib.sleep(1)
 
     bot = Trader(ib, Order, MarketOrder, a, agg_ks, base_tf=base_tf)
+
+    _CHATTER = {2104, 2106, 2107, 2108, 2119, 2158, 1102}     # farm/data-status notices
+
+    def on_error(reqId, code, msg, contract=None):
+        """AUDIT FIND 2026-09-01: order rejections and disconnects were only ever printed
+        to the terminal — invisible in the log, invisible on the board. Now they are
+        part of the day's record."""
+        if code in _CHATTER:
+            return
+        sym = f" {contract.symbol}" if contract is not None and getattr(contract, "symbol", "") else ""
+        bot._say(f"  ⚠️ IBKR error {code}{sym} (req {reqId}): {msg}")
+    ib.errorEvent += on_error
     mode = "🔴 ARMED — placing PAPER orders" if a.arm else "🟢 SHADOW — logging only, no orders"
     print(f"ORDER ROBOT — IBKR paper — {mode}")
     print(f"  PRE-ARM entries: brackets REST during the handle (backtest-faithful first-touch fills)")

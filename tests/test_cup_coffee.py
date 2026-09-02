@@ -291,6 +291,33 @@ def test_replay_still_arms_after_first_symbols_eod():
     assert "TEST" in tr.pending, "the eod_done guard must never block replay's later symbols"
 
 
+def test_flatten_routes_via_smart_and_verifies():
+    """2026-09-01: DUOL survived overnight because the close was placed on the
+    position's LISTING exchange contract (rejected silently). The flatten must route
+    every close via SMART and report what IBKR confirmed."""
+    from types import SimpleNamespace as NS
+    tr = _mini_trader(replay=False)
+    placed = []
+
+    class FakeIB:
+        def reqGlobalCancel(self): pass
+        def accountValues(self): return []
+        def sleep(self, s): pass
+        def positions(self):
+            return [NS(contract=NS(symbol="DUOL", exchange="NASDAQ", conId=1), position=247)]
+        def qualifyContracts(self, c): return [c]
+        def placeOrder(self, contract, order):
+            placed.append((contract, order))
+            return NS(orderStatus=NS(status="Filled"), log=[])
+    tr.ib = FakeIB()
+    tr.MarketOrder = lambda act, qty: NS(action=act, totalQuantity=qty)
+    tr.flatten("EOD 15:49")
+    assert len(placed) == 1, "exactly one close order for one open position"
+    contract, order = placed[0]
+    assert contract.exchange == "SMART", f"close must be routed SMART, got {contract.exchange!r}"
+    assert order.action == "SELL" and order.totalQuantity == 247
+
+
 # --------------------------------------------------------------------------- runner
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
