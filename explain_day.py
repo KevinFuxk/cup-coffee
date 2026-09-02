@@ -101,7 +101,7 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     symbols = args[0] if args and not args[0][0].isdigit() else None
     day = next((a for a in args if a[0].isdigit()), None)
-    syms, src = read_watchlist(symbols, "data/watchlist.txt")
+    syms, src = read_watchlist(symbols, "auto")   # today's export, never the stale fallback
 
     try:
         from ib_async import IB, Stock
