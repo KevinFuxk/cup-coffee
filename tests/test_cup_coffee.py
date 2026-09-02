@@ -311,11 +311,17 @@ def test_flatten_routes_via_smart_and_verifies():
             return NS(orderStatus=NS(status="Filled"), log=[])
     tr.ib = FakeIB()
     tr.MarketOrder = lambda act, qty: NS(action=act, totalQuantity=qty)
+    said = []
+    tr._say = said.append
     tr.flatten("EOD 15:49")
     assert len(placed) == 1, "exactly one close order for one open position"
     contract, order = placed[0]
     assert contract.exchange == "SMART", f"close must be routed SMART, got {contract.exchange!r}"
     assert order.action == "SELL" and order.totalQuantity == 247
+    # no event loop is running here (the Ctrl-C/replay path) -> the caller verifies explicitly
+    tr.verify_flatten()
+    assert any("✅ close DUOL +247" in l for l in said), said
+    assert any("STILL OPEN" in l for l in said), "an unconfirmed position must be shouted"
 
 
 def test_tv_export_recognized_by_content_not_name():
@@ -329,6 +335,22 @@ def test_tv_export_recognized_by_content_not_name():
     assert not is_tv_export(p), "prose must never be mistaken for a watchlist"
     open(p, "w").write("NVDA\nAMD\n")
     assert not is_tv_export(p), "a bare hand-typed list is not a TradingView export"
+
+
+def test_hot_add_is_additive_and_fresh_only():
+    """The Fly publishes at 09:55: a re-export mid-session must ADD its names to the
+    running bot — never remove one (it may hold a position), never from a stale file."""
+    import os, time
+    from live_trader_ibkr import watchlist_additions
+    p = "/tmp/hotadd_test.txt"
+    open(p, "w").write("###CNBC,NASDAQ:NVDA,###THE FLY,NASDAQ:DPZ,NYSE:LVS")
+    today = datetime.now().date()
+    assert watchlist_additions({"NVDA", "AAPL"}, p, today) == ["DPZ", "LVS"]   # AAPL not removed
+    assert watchlist_additions({"NVDA", "DPZ", "LVS"}, p, today) == []
+    old = time.time() - 2 * 86400
+    os.utime(p, (old, old))                                                    # yesterday's export
+    assert watchlist_additions({"NVDA"}, p, today) == [], "a stale export must inject nothing"
+    assert watchlist_additions({"NVDA"}, None, today) == []
 
 
 # --------------------------------------------------------------------------- runner

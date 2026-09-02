@@ -94,6 +94,20 @@ def is_tv_export(path: str) -> bool:
     return tagged >= max(2, len(fields) // 2)
 
 
+def watchlist_additions(known: set[str], path: str | None, today) -> list[str]:
+    """HOT-ADD (user need 2026-09-02: The Fly publishes at 09:55, after the open).
+    Given the symbols already running and the newest export on disk, return the NEW
+    tickers to bring online — only from an export saved TODAY (a stale file must never
+    inject names), and never removals: a symbol may have an open position, so the
+    running set only grows during a session."""
+    if not path or not os.path.exists(path):
+        return []
+    if datetime.fromtimestamp(os.path.getmtime(path), ET).date() != today:
+        return []
+    syms, _ = read_watchlist(None, path)
+    return [x for x in syms if x not in known]
+
+
 def read_watchlist(cli_symbols: str | None, path: str) -> tuple[list[str], str]:
     """Where the day's tickers come from, in priority order:
          1. symbols typed on the command line
@@ -139,7 +153,7 @@ def read_watchlist(cli_symbols: str | None, path: str) -> tuple[list[str], str]:
         return clean(cli_symbols), "command line"
     resolved = resolve_watchlist(path)
     if resolved:
-        syms = clean(open(resolved).read())
+        syms = clean(open(resolved, errors="ignore").read())
         if syms and resolved == "data/watchlist.txt":
             print("\n" + "!" * 78 + "\n!!  NO TradingView export found in ~/Downloads — using the STALE fallback\n"
                   "!!  data/watchlist.txt. If you exported today, the file was not recognized:\n"
@@ -169,8 +183,8 @@ def archive_watchlist(path: str | None) -> None:
         return
     os.makedirs("data/watchlists", exist_ok=True)
     dst = f"data/watchlists/{datetime.now(ET):%Y-%m-%d}.txt"
-    content = open(path).read()
-    if os.path.exists(dst) and open(dst).read() == content:
+    content = open(path, errors="ignore").read()
+    if os.path.exists(dst) and open(dst, errors="ignore").read() == content:
         return
     with open(dst, "w") as f:
         f.write(content)
@@ -478,14 +492,17 @@ class Trader:
                 o.transmit = True
                 self.ib.placeOrder(tr.contract, o)
             # AUDIT FIND 2026-09-01: the DUOL stop modify (156.54 -> 156.51) never took
-            # effect at IBKR while the quantity did. Read the echo back and say so.
-            self.ib.sleep(1)
-            sl = pend["trades"].get("SL")
-            if sl is not None and abs(float(sl.order.auxPrice or 0) - pend["stop"]) > 0.005:
-                self._say(f"  🚨 stop modify NOT applied at IBKR: server holds ${sl.order.auxPrice} "
-                          f"(wanted ${pend['stop']:.2f}) — risk differs from the ledger")
+            # effect at IBKR while the quantity did. Read the echo back (scheduled, never
+            # blocking inside the callback) and say so.
+            self._defer(1, lambda: self._check_modify(pend))
         except Exception as ex:
             self._say(f"  ⚠️ modify failed for {pend['ref']}: {ex}")
+
+    def _check_modify(self, pend):
+        sl = (pend.get("trades") or {}).get("SL")
+        if sl is not None and abs(float(sl.order.auxPrice or 0) - pend["stop"]) > 0.005:
+            self._say(f"  🚨 stop modify NOT applied at IBKR: server holds ${sl.order.auxPrice} "
+                      f"(wanted ${pend['stop']:.2f}) — risk differs from the ledger")
 
     # ---- pending-setup lifecycle -------------------------------------------
     def arm_pending(self, sym, tf, ri, st, B):
@@ -643,16 +660,38 @@ class Trader:
             closes.append((sym, p.position, tr))
         n = len(closes)
         self._say(f"  ⛔ FLATTEN ({reason}) — cancelled all orders (incl. pendings), closing {n} position(s)")
-        if closes:                                     # a flatten is only real once confirmed
-            self.ib.sleep(3)
-            for sym, qty, tr in closes:
-                st = tr.orderStatus.status
-                why = f" — {tr.log[-1].message}" if st != "Filled" and tr.log else ""
-                self._say(f"  {'✅' if st == 'Filled' else '🚨'} close {sym} {qty:+.0f} sh: {st}{why}")
+        self._closes = closes
+        if closes and not self._defer(3, self.verify_flatten):
+            pass                                       # no event loop running (Ctrl-C path): main sleeps, then verifies
+
+    def _defer(self, seconds: float, fn) -> bool:
+        """Run fn after `seconds` WITHOUT blocking. Inside the IBKR event loop (every stream
+        callback) a blocking ib.sleep() raises 'event loop is already running' — and eventkit
+        swallows it silently (review find 2026-09-02: the flatten confirmation never ran and
+        eod_done was never set). So: schedule on the running loop. Returns False when no loop
+        is running (the Ctrl-C / replay path), in which case the caller sleeps and calls fn."""
+        import asyncio
+        try:
+            asyncio.get_running_loop().call_later(seconds, fn)
+            return True
+        except RuntimeError:
+            return False
+
+    def verify_flatten(self):
+        """A flatten is only real once IBKR confirms it. Idempotent."""
+        closes, self._closes = getattr(self, "_closes", []), []
+        for sym, qty, tr in closes:
+            st = tr.orderStatus.status
+            why = f" — {tr.log[-1].message}" if st != "Filled" and tr.log else ""
+            self._say(f"  {'✅' if st == 'Filled' else '🚨'} close {sym} {qty:+.0f} sh: {st}{why}")
+        try:
             left = [p for p in self.ib.positions() if p.position != 0]
-            if left:
-                self._say("  🚨 STILL OPEN after flatten — CLOSE MANUALLY NOW: "
-                          + ", ".join(f"{p.contract.symbol} {p.position:+.0f}" for p in left))
+        except Exception as ex:
+            self._say(f"  ⚠️ could not read positions to confirm the flatten: {ex}")
+            return
+        if left:
+            self._say("  🚨 STILL OPEN after flatten — CLOSE MANUALLY NOW: "
+                      + ", ".join(f"{p.contract.symbol} {p.position:+.0f}" for p in left))
 
     # ---- bar pipeline ----------------------------------------------------------
     def on_closed_bar(self, sym, tf, t, o, h, l, c, v) -> bool:
@@ -887,7 +926,12 @@ def main():
         print("  REPLAY MODE — walking the most recent COMPLETED session. ⚠️ run BEFORE ~16:15 ET and "
               "that is the PREVIOUS trading day, not today. All times below belong to that session.\n")
     skipped = []
-    for s in syms:
+
+    def setup_symbol(s: str, say=print) -> bool:
+        """Bring ONE symbol online: qualify, seed history, attach the stream. Used at
+        startup and by the mid-session hot-add (same path, so a 09:55 addition behaves
+        exactly like a late start: the seed shows it the whole morning, arming begins
+        on the next live bar)."""
         c = Stock(s, "SMART", "USD")
         try:
             # A raw TradingView export can contain non-equities (TVC:VIX, TVC:USOIL, futures,
@@ -899,9 +943,9 @@ def main():
                 raise ValueError("unknown contract — not a US stock at IBKR")
         except Exception as ex:
             skipped.append(s)
-            print(f"  {s}: SKIPPED — {ex if str(ex) else type(ex).__name__} "
-                  f"(not a US stock at IBKR? remove it from the watchlist)")
-            continue
+            say(f"  {s}: SKIPPED — {ex if str(ex) else type(ex).__name__} "
+                f"(not a US stock at IBKR? remove it from the watchlist)")
+            return False
         bot.contracts[s] = c
         # 5 D lookback, NOT 1 D: the window must ALWAYS contain >=1 trading session (holiday
         # weekends!). NOTE: on the free DELAYED tier this returns COMPLETED sessions only —
@@ -914,12 +958,18 @@ def main():
                 return x.date.astimezone(ET).date() if hasattr(x.date, "astimezone") else x.date.date()
             last_day = max(_d(x) for x in bl)
             feed = [x for x in bl if _d(x) == last_day]
+        was_live = bot._report
         bot.ingest(s, feed, report=a.replay)           # replay: walk that session with full lifecycle prints
+        bot._report = was_live or a.replay             # a mid-session seed must not silence the live board
         seeded = " ".join(f"{len(bot.store.get((s, t), []))} {t}" for t in tfs)
         if stream:
             bl.updateEvent += on_update
             seeds.append((s, bl))
-        print(f"  {s}: seeded {seeded} bars")
+        say(f"  {s}: seeded {seeded} bars")
+        return True
+
+    for s in syms:
+        setup_symbol(s)
     if skipped:
         syms = [s for s in syms if s not in skipped]
         print(f"\n  ⚠️ {len(skipped)} symbol(s) skipped: {', '.join(skipped)} — trading {len(syms)}")
@@ -1010,21 +1060,60 @@ def main():
     poll_iv = max(30, len(syms) * 12)                  # IB pacing: <= 60 historical requests / 10 min
     label = f"running (POLLING every {poll_iv}s)…" if a.poll else "running…"
     print(f"\n{label}  (Ctrl-C to flatten everything + stop)\n")
+    def hot_add():
+        """Every 30s: if a NEWER export (saved today) names symbols we are not running,
+        bring them online without touching anything already live. Additive only.
+        Skipped when the symbols came from the command line (an explicit list is fixed).
+        Review finds 2026-09-02: only during the session (09:30-15:45 — a seed after 15:49
+        re-opens the day and fires a second flatten; a post-close export is TOMORROW's
+        list), never in delayed tick mode (new names could not stream), and never fatal
+        (an exception here on the main thread would skip the kill-switch flatten)."""
+        if a.symbols or tickmode:
+            return
+        now = datetime.now(ET)
+        if not (dtime(9, 30) <= now.time() < dtime(15, 45)):
+            return
+        try:
+            path = resolve_watchlist(a.watchlist)
+            new = watchlist_additions(set(bot.contracts) | set(skipped), path, now.date())
+            if not new:
+                return
+            bot._say(f"  🧩 {now:%H:%M} watchlist grew — adding {', '.join(new)}")
+            for s_ in new:
+                if setup_symbol(s_, say=bot._say):
+                    syms.append(s_)
+            archive_watchlist(path)                    # the day's archive = the day's final list
+        except Exception as ex:
+            bot._say(f"  ⚠️ hot-add failed ({type(ex).__name__}: {ex}) — still trading the current list")
+
     try:
         if a.poll:
             while True:
-                ib.sleep(poll_iv)
-                for s in syms:
+                ib.sleep(max(30, len(syms) * 12))     # re-sized: hot_add can grow the list
+                hot_add()
+                for s in list(syms):
                     pl = ib.reqHistoricalData(bot.contracts[s], endDateTime="", durationStr="1 D",
                                               barSizeSetting=bar_size, whatToShow="TRADES",
                                               useRTH=True, formatDate=2, keepUpToDate=False)
                     bot.ingest(s, pl, report=True)
         else:
-            ib.run()
+            while True:                                # ib.sleep keeps the event loop (streams) running
+                ib.sleep(30)
+                hot_add()
     except KeyboardInterrupt:
         print("\n⛔ kill-switch — flattening…")
         bot.flatten("kill-switch")
-        ib.sleep(2)
+        ib.sleep(3)
+        bot.verify_flatten()
+    except Exception as ex:                            # never exit with positions open, silently
+        print(f"\n💥 fatal: {type(ex).__name__}: {ex} — attempting to flatten…")
+        try:
+            bot.flatten("fatal error")
+            ib.sleep(3)
+            bot.verify_flatten()
+        except Exception as ex2:
+            print(f"   flatten impossible ({ex2}) — CHECK THE ACCOUNT MANUALLY")
+        raise
     finally:
         ib.disconnect()
 
