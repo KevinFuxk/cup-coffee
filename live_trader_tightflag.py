@@ -77,9 +77,13 @@ from data_layer import Bars
 ET = ZoneInfo("America/New_York")
 LIVE_PORTS = {4001, 7496}
 FILLS_CSV = "data/paper_fills_tightflag.csv"
-LEDGER_CSV = "data/tightflag_trades.csv"      # THE trade log: every trade, every day,
-                                             # appended forever. One row per symbol-session
-                                             # (re-running a day updates its row, never dupes).
+# REAL-MARKET runs only (USER 2026-09-01: real and replayed trades must never share
+# a file). shadow/armed sessions write here — what the bot actually saw and did in
+# the market, one row per symbol-session, upserted. Replays and cache regressions
+# NEVER write here: the official replayed record is data/replay_trades_tightflag.csv,
+# owned by the record_tightflag.py evening pipeline. Broker fill confirmations (with
+# slippage) are a third, separate file: data/paper_fills_tightflag.csv.
+LEDGER_CSV = "data/live_trades_tightflag.csv"
 REF_PREFIX = "TF"                      # every order this bot creates carries it
 EOD = dtime(15, 49)
 # The frozen labeler exits at the close of the LAST 5-min window that STARTS at or
@@ -613,6 +617,16 @@ class TightFlagTrader:
         trade. One trade, one row: a re-run REPLACES its own row rather than adding
         another, so live and replay of the same session can never double-count."""
         if not self.closed:
+            return
+        if self.RUN_MODE not in ("shadow", "armed"):
+            # replay/cache results are NOT market activity — they belong to the
+            # record pipeline (data/replay_trades_tightflag.csv) or to nothing at all.
+            tot = sum(c["r"] for c in self.closed)
+            self.session_tally.extend(self.closed)
+            self.say(f"\n  📒 {len(self.closed)} {self.RUN_MODE} trade(s), {tot:+.2f}R — "
+                     f"NOT written to the live ledger (replayed data records via "
+                     f"record_tightflag.py)")
+            self.closed = []
             return
         os.makedirs("data", exist_ok=True)
         cols = ["time","symbol","side","entry","exit","exit_kind","R_unit","pnl_R","qty",
