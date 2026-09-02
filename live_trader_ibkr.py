@@ -67,15 +67,31 @@ def resolve_watchlist(path: str) -> str | None:
     import glob
     if path and path != "auto":
         return path if os.path.exists(path) else None
-    # match case-INSENSITIVELY: TradingView names the export after the watchlist,
-    # and "daytrade" vs "DayTrade" must not silently fall back to a stale list
-    # (2026-08-26: a lowercase rename made the bot trade the 8/21 watchlist).
-    cands = [c for c in glob.glob(os.path.expanduser("~/Downloads/*.txt"))
-             if "daytrade" in os.path.basename(c).lower()]
+    # Recognize a TradingView export by its CONTENT, never its filename: the user renames
+    # the watchlist daily (2026-08-26 "daytrade" lowercase, 2026-09-02 "9_2_2026.txt" with
+    # no keyword at all) and every filename rule eventually fails silently into the stale
+    # data/watchlist.txt. Newest export by modification time wins.
+    cands = [c for c in glob.glob(os.path.expanduser("~/Downloads/*.txt")) if is_tv_export(c)]
     if cands:
-        newest = max(cands, key=os.path.getmtime)
-        return newest
+        return max(cands, key=os.path.getmtime)
     return "data/watchlist.txt" if os.path.exists("data/watchlist.txt") else None
+
+
+def is_tv_export(path: str) -> bool:
+    """A TradingView watchlist export: a small text file whose fields are ###SECTION
+    headers and EXCHANGE:TICKER tokens (NASDAQ:NVDA, AMEX:SPY, NYSE:DE ...)."""
+    try:
+        if os.path.getsize(path) > 200_000:
+            return False
+        raw = open(path, errors="ignore").read(20_000)
+    except OSError:
+        return False
+    fields = [f.strip() for f in raw.replace("\n", ",").split(",") if f.strip()]
+    if not fields:
+        return False
+    tagged = sum(1 for f in fields if f.startswith("###")
+                 or (":" in f and f.split(":")[0].isalpha() and f.split(":")[0].isupper()))
+    return tagged >= max(2, len(fields) // 2)
 
 
 def read_watchlist(cli_symbols: str | None, path: str) -> tuple[list[str], str]:
@@ -124,6 +140,10 @@ def read_watchlist(cli_symbols: str | None, path: str) -> tuple[list[str], str]:
     resolved = resolve_watchlist(path)
     if resolved:
         syms = clean(open(resolved).read())
+        if syms and resolved == "data/watchlist.txt":
+            print("\n" + "!" * 78 + "\n!!  NO TradingView export found in ~/Downloads — using the STALE fallback\n"
+                  "!!  data/watchlist.txt. If you exported today, the file was not recognized:\n"
+                  "!!  Ctrl-C now and pass it explicitly:  --watchlist ~/Downloads/<file>.txt\n" + "!" * 78 + "\n")
         if syms:
             age = (datetime.now().timestamp() - os.path.getmtime(resolved)) / 3600
             stale = f"  ⚠️ {age/24:.0f} days old — re-export?" if age > 20 else ""

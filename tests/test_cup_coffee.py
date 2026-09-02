@@ -318,6 +318,19 @@ def test_flatten_routes_via_smart_and_verifies():
     assert order.action == "SELL" and order.totalQuantity == 247
 
 
+def test_tv_export_recognized_by_content_not_name():
+    """2026-09-02: the export was named '9_2_2026.txt' — no keyword — and the bot fell
+    back to a stale list. Exports must be recognized by their content."""
+    from live_trader_ibkr import is_tv_export
+    p = "/tmp/9_2_2026_test.txt"
+    open(p, "w").write("###INDEX,NASDAQ:QQQ,AMEX:SPY,###CNBC,NASDAQ:NVDA,NYSE:DE")
+    assert is_tv_export(p), "a real TradingView export must be recognized whatever its name"
+    open(p, "w").write("Dear diary, today the market was volatile and I felt unsure.")
+    assert not is_tv_export(p), "prose must never be mistaken for a watchlist"
+    open(p, "w").write("NVDA\nAMD\n")
+    assert not is_tv_export(p), "a bare hand-typed list is not a TradingView export"
+
+
 # --------------------------------------------------------------------------- runner
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
