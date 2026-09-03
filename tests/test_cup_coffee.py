@@ -26,6 +26,11 @@ What is covered, mapped to the gate numbers in what_the_code_actually_does.md §
   aggregator            2-min clock-aligned buckets, gap handling
   watchlist parser      raw TradingView export -> tickers
   real-day golden       re-detect one cached SPY day, must match the recorded pile
+  ORDER STATE (armed)   'entered' = IBKR's fill count (grace bar, then MISSED FILL, never a ghost);
+                        re-place under a new ref, never after a fill, fill-race kills the successor;
+                        own-book share counts per ref (partial exits stay on the book);
+                        flatten = MY orders + MY book only, routed SMART, verified;
+                        watchdog = own book, live children only, repairs inside the OCA group
 """
 # this file lives in a subfolder — put the project root on sys.path and work from it
 import os as _os, sys as _sys
@@ -256,8 +261,8 @@ def _mini_trader(replay: bool):
 
     class DummyIB:
         def accountValues(self): return []
-        def reqGlobalCancel(self): pass
         def positions(self): return []
+        def openTrades(self): return []
     a = Namespace(replay=replay, arm=False, minstop=0.0, risk=0.01, base=10000,
                   tp=6.0, max_positions=5)
     tr = Trader(DummyIB(), None, None, a, agg_ks=[])
@@ -289,44 +294,6 @@ def test_replay_still_arms_after_first_symbols_eod():
     tr.eod_done = True                              # set by the previous symbol's 15:49
     tr.reconcile("TEST", "1min", b)
     assert "TEST" in tr.pending, "the eod_done guard must never block replay's later symbols"
-
-
-def test_flatten_routes_via_smart_and_verifies():
-    """2026-09-01: DUOL survived overnight because the close was placed on the
-    position's LISTING exchange contract (rejected silently). The flatten must route
-    every close via SMART and report what IBKR confirmed."""
-    from types import SimpleNamespace as NS
-    tr = _mini_trader(replay=False)
-    placed = []
-
-    class FakeIB:
-        def reqGlobalCancel(self): pass
-        def accountValues(self): return []
-        def sleep(self, s): pass
-        def positions(self):
-            return [NS(contract=NS(symbol="DUOL", exchange="NASDAQ", conId=1), position=247)]
-        def qualifyContracts(self, c): return [c]
-        def placeOrder(self, contract, order):
-            placed.append((contract, order))
-            return NS(orderStatus=NS(status="Filled"), log=[])
-    tr.ib = FakeIB()
-    tr.MarketOrder = lambda act, qty: NS(action=act, totalQuantity=qty)
-    said = []
-    tr._say = said.append
-    tr.flatten("EOD 15:49")
-    assert len(placed) == 1, "exactly one close order for one open position"
-    contract, order = placed[0]
-    assert contract.exchange == "SMART", f"close must be routed SMART, got {contract.exchange!r}"
-    assert order.action == "SELL" and order.totalQuantity == 247
-    # no event loop is running here (the Ctrl-C/replay path) -> the caller verifies explicitly
-    tr.verify_flatten()
-    assert any("✅ close DUOL +247" in l for l in said), said
-    assert any("STILL OPEN" in l for l in said), "an unconfirmed position must be shouted"
-    # 2026-09-02 storm: 74 flattens in 30s oversold into a SHORT. A second flatten inside
-    # the in-flight window must place NOTHING.
-    tr.flatten("EOD 15:49")
-    assert len(placed) == 1, "re-fired flatten must not place a second close"
-    assert any("already in flight" in l for l in said)
 
 
 def test_tv_export_recognized_by_content_not_name():
@@ -387,6 +354,254 @@ def test_scan_memo_is_exactly_equivalent_on_a_real_day():
             assert inc == scan_setups(d, pre), f"memo diverged from the full scan at n={n}"
             checked += 1
     print(f"   (memo == full scan at {checked} prefixes of a {len(full)}-bar real day)")
+
+
+def test_universe_rules_as_code():
+    """The old screening rules, live: >= $15, common stock only, no commodity names."""
+    from types import SimpleNamespace as NS
+    from live_trader_ibkr import universe_verdict
+    assert universe_verdict(36.7, NS(stockType="COMMON", industry="Technology", category="Semiconductors")) == ""
+    assert "floor" in universe_verdict(13.53, NS(stockType="COMMON", industry="Consumer, Non-cyclical", category="Pharmaceuticals"))
+    assert "not common" in universe_verdict(100.0, NS(stockType="ETF", industry="", category=""))
+    assert "commodity" in universe_verdict(160.0, NS(stockType="COMMON", industry="Energy", category="Oil&Gas"))
+    assert "commodity" in universe_verdict(128.0, NS(stockType="COMMON", industry="Basic Materials", category="Chemicals"))
+    assert universe_verdict(15.06, NS(stockType="COMMON", industry="Energy", category="Energy-Alternate Sources")) == ""
+    assert universe_verdict(None, None) == ""            # unknown price/details: never a false drop
+
+
+class _Ev:
+    """ib_async-style event: `tr.fillEvent += handler`."""
+    def __init__(self): self.fs = []
+    def __iadd__(self, f): self.fs.append(f); return self
+    def fire(self, *a):
+        for f in self.fs: f(*a)
+
+
+def _armed_trader():
+    """A Trader in --arm mode against a fake IBKR that records every order and never
+    fills by itself: the tests decide what IBKR 'filled'."""
+    import itertools
+    from types import SimpleNamespace as NS
+    import live_trader_ibkr as L
+    L.FILLS_CSV = "/tmp/test_paper_fills.csv"      # never the real data/paper_fills.csv
+    tr = _mini_trader(replay=False)
+    tr.a.arm = True
+    trades, cancelled, said = [], [], []
+    tr._say = said.append
+
+    class FakeTrade:
+        def __init__(self, contract, order):
+            self.contract, self.order = contract, order
+            self.orderStatus = NS(status="Submitted", filled=0)
+            self.fillEvent, self.log = _Ev(), []
+
+    class FakeIB:
+        client = NS(getReqId=itertools.count(100).__next__)
+        def accountValues(self): return []
+        def positions(self): return []
+        def openTrades(self): return [t for t in trades if t.orderStatus.status in ("Submitted", "PreSubmitted")]
+        def placeOrder(self, c, o):
+            t = FakeTrade(c, o); trades.append(t); return t
+        def cancelOrder(self, o):
+            cancelled.append(o.orderRef)
+            for t in trades:
+                if t.order is o:
+                    t.orderStatus.status = "Cancelled"
+    tr.ib = FakeIB()
+    tr.Order = lambda **kw: NS(**kw)
+    tr.MarketOrder = lambda act, qty: NS(action=act, orderType="MKT", totalQuantity=qty, auxPrice=0, lmtPrice=0)
+    tr.contracts = {"TEST": NS(symbol="TEST", exchange="SMART")}
+    return tr, trades, cancelled, said
+
+
+def test_armed_entered_is_what_ibkr_filled_not_what_the_bar_says():
+    """ROOT CAUSE of the 2026-09-02 ALMS double position: the pending was popped on the
+    BAR's say-so while the buy-stop still rested at IBKR (stops trigger on quotes, not on
+    a print) -> a ghost bracket, then a second one armed on the next rim. Armed 'entered'
+    must be IBKR's fill count: unfilled = one bar of grace, then cancel + MISSED FILL."""
+    hl = golden_hl()
+    # (a) the bar breaks out, IBKR never fills
+    tr, trades, cancelled, said = _armed_trader()
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:25]))            # arms at the bar-3 close
+    assert "TEST" in tr.pending and len(trades) == 3
+    ref = tr.pending["TEST"]["ref"]
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:26]))            # bar 25 crosses the trigger
+    assert "TEST" in tr.pending and cancelled == [], "grace: a fill can lag the bar by seconds"
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:27]))            # still 0 filled -> never a ghost
+    assert "TEST" not in tr.pending and cancelled == [ref], cancelled
+    assert any("MISSED FILL" in l for l in said), said
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:28]))
+    assert len(trades) == 3, "no second bracket may appear after the missed fill"
+    # (b) IBKR filled the whole entry -> settled, nothing cancelled
+    tr, trades, cancelled, said = _armed_trader()
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:25]))
+    trades[0].orderStatus.filled = tr.pending["TEST"]["qty"]
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:26]))
+    assert "TEST" not in tr.pending and cancelled == [] and tr.entered_at[("TEST", "1min")] == 25
+    # (c) partial fill -> grace, then the REMAINDER is cancelled and the fill is ours
+    tr, trades, cancelled, said = _armed_trader()
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:25]))
+    ref = tr.pending["TEST"]["ref"]
+    trades[0].orderStatus.filled = 5
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:26]))
+    assert "TEST" in tr.pending and cancelled == []
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:27]))
+    assert "TEST" not in tr.pending and cancelled == [ref] and any("PARTIAL" in l for l in said)
+
+
+def test_replace_uses_a_new_ref_and_never_after_a_fill():
+    """IBKR 10326: OCA children cannot be revised, so a deeper handle = cancel + re-place.
+    The re-place must carry a NEW ref (= new OCA group), keep the old ref's levels as a
+    snapshot, be skipped once anything filled, and — if the old parent fills inside the
+    cancel's round trip — the successor must be cancelled by the fill itself."""
+    from types import SimpleNamespace as NS
+    hl = golden_hl()
+    hl[25] = (99.4, 99.1)                                           # handle deepens instead of breaking
+    tr, trades, cancelled, said = _armed_trader()
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:25]))
+    ref1 = tr.pending["TEST"]["ref"]
+    assert abs(tr.pending["TEST"]["stop"] - 99.2) < 1e-9
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:26]))
+    p = tr.pending["TEST"]
+    assert cancelled == [ref1] and p["ref"] == ref1 + "-r2", (cancelled, p["ref"])
+    assert abs(p["stop"] - 99.1) < 1e-9 and len(trades) == 6
+    assert p["trades"]["TP"].order.ocaGroup == p["ref"] and p["trades"]["SL"].order.orderRef == p["ref"]
+    assert abs(tr.brackets[ref1]["stop"] - 99.2) < 1e-9, "the old ref keeps the levels it was placed at"
+    assert abs(tr.brackets[p["ref"]]["stop"] - 99.1) < 1e-9
+    # the race: the OLD parent's fill arrives after the re-place -> successor cancelled, book = old ref
+    qty = tr.brackets[ref1]["qty"]
+    fill = NS(execution=NS(price=99.81, shares=qty), time="2026-08-20 09:55:00")
+    tr._fill_logger("ENTRY")(trades[0], fill)
+    assert cancelled[-1] == p["ref"] and "TEST" not in tr.pending
+    assert tr.open_real[ref1]["qty"] == qty and any("filled while being re-placed" in l for l in said)
+    # a bracket that already (partly) filled is never re-placed
+    tr, trades, cancelled, said = _armed_trader()
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:25]))
+    trades[0].orderStatus.filled = 3
+    tr.reconcile("TEST", "1min", bars_from_hl(hl[:26]))
+    assert cancelled == [] and len(trades) == 3 and "TEST" in tr.pending, "no re-place after a fill"
+
+
+def test_fill_logger_tracks_shares_per_ref():
+    """ALMS 2026-09-02: TP filled 85 of 2,552 and the bot booked the trade CLOSED. The book
+    must count shares: closed only at zero, exit price blended over the partial legs."""
+    from types import SimpleNamespace as NS
+    tr, trades, cancelled, said = _armed_trader()
+    ref = "cuph-ALMS-15s-2026-09-02-rim40"
+    tr.brackets[ref] = dict(tf="15s", stop=10.52, target=10.79, trigger=10.55)
+    c = NS(symbol="ALMS")
+    def fill(kind, otype, level, sh, px):
+        o = NS(orderRef=ref, orderType=otype, action="BUY" if kind == "ENTRY" else "SELL",
+               lmtPrice=level if otype == "LMT" else 0, auxPrice=level if otype == "STP" else 0)
+        tr._fill_logger(kind)(NS(contract=c, order=o), NS(execution=NS(price=px, shares=sh), time="t"))
+    fill("ENTRY", "STP", 10.55, 2552, 10.56)
+    assert tr.open_real[ref]["qty"] == 2552 and abs(tr.open_real[ref]["entry"] - 10.56) < 1e-9
+    fill("TP", "LMT", 10.79, 85, 10.79)
+    assert ref in tr.open_real and tr.open_real[ref]["qty"] == 2467, "a partial exit keeps the rest on the book"
+    assert tr.closed == [] and any("still on the book" in l for l in said)
+    fill("SL", "STP", 10.52, 2467, 10.51)
+    assert ref not in tr.open_real and len(tr.closed) == 1
+    blended = (85 * 10.79 + 2467 * 10.51) / 2552
+    assert abs(tr.closed[0]["exit"] - blended) < 1e-9 and tr.closed[0]["kind"] == "SL"
+
+
+def test_flatten_closes_own_book_only_via_smart_and_verifies():
+    """2026-09-01: DUOL survived overnight (close placed on the LISTING exchange, rejected
+    silently). 2026-09-02: reqGlobalCancel + 'close every account position' also hit the
+    tight-flag robot's orders and shares. The flatten must cancel only MY orders, close
+    only MY book (one market order per ref, routed SMART), shout about account positions
+    it does not own, and report what IBKR confirmed."""
+    from types import SimpleNamespace as NS
+    tr, trades, cancelled, said = _armed_trader()
+    ref = "cuph-DUOL-15s-2026-09-01-rim7"
+    tr.contracts = {"DUOL": NS(symbol="DUOL", exchange="SMART", conId=1)}
+    tr.brackets = {ref: {}}
+    tr.open_real = {ref: dict(sym="DUOL", tf="15s", entry=157.97, qty=247, cost=247 * 157.97, out=0.0,
+                              out_qty=0, stop=157.50, target=160.0, trigger=157.97, ts=None)}
+    tr.pending = {}
+    book = [NS(contract=NS(symbol="DUOL"), orderStatus=NS(status="Submitted", filled=0),
+               order=NS(orderRef=ref, action="SELL", orderType="STP", parentId=0, totalQuantity=247)),
+            NS(contract=NS(symbol="QQQ"), orderStatus=NS(status="Submitted", filled=0),
+               order=NS(orderRef="TF-QQQ-1", action="SELL", orderType="STP", parentId=0, totalQuantity=100))]
+    placed, status = [], ["Filled"]
+
+    class FakeIB:
+        def accountValues(self): return []
+        def openTrades(self): return book
+        def positions(self):
+            return [NS(contract=NS(symbol="DUOL", exchange="NASDAQ"), position=347),   # 100 not ours
+                    NS(contract=NS(symbol="QQQ", exchange="NASDAQ"), position=100)]     # tight-flag's
+        def cancelOrder(self, o): cancelled.append(o.orderRef)
+        def placeOrder(self, c, o):
+            placed.append((c, o))
+            return NS(orderStatus=NS(status=status[0]), log=[], fillEvent=_Ev())
+    tr.ib = FakeIB()
+    tr.flatten("EOD 15:49")
+    assert cancelled == [ref], f"only MY order may be cancelled, got {cancelled}"
+    assert len(placed) == 1, "exactly one close, for MY 247 DUOL — never the tight-flag QQQ"
+    contract, order = placed[0]
+    assert contract.exchange == "SMART", f"close must be routed SMART, got {contract.exchange!r}"
+    assert order.action == "SELL" and order.totalQuantity == 247 and order.orderRef == ref
+    assert any("DUOL: account holds +347" in l and "NOT mine" in l for l in said), said
+    assert not any("QQQ" in l for l in said), "a symbol we do not trade is not our business"
+    tr.verify_flatten()                                             # no loop here: caller verifies
+    assert any("✅ close DUOL +247" in l for l in said), said
+    assert not any("STILL OPEN" in l for l in said)
+    # a rejected close must be shouted
+    status[0] = "Inactive"
+    tr._last_flatten = 0
+    tr.flatten("EOD 15:49")
+    tr.verify_flatten()
+    assert any("STILL OPEN" in l and "DUOL +247" in l for l in said), said
+    # 2026-09-02 storm: 74 flattens in 30s oversold into a SHORT. Inside the in-flight
+    # window a re-fired flatten must place NOTHING.
+    n = len(placed)
+    tr.flatten("EOD 15:49")
+    assert len(placed) == n and any("already in flight" in l for l in said)
+
+
+def test_guard_protects_own_book_only_and_counts_only_live_children():
+    """The watchdog: every share on MY book has a working stop, oversized exits are cut,
+    a flat book keeps no exit orders — sized off MY fills, never the account view (which
+    also holds the tight-flag robot's shares), counting only children whose parent filled
+    (a resting bracket's children protect nothing), repairing INSIDE the ref's OCA group."""
+    from types import SimpleNamespace as NS
+    tr, trades, cancelled, said = _armed_trader()
+    ref = "cuph-ALMS-15s-2026-09-02-rim40"
+    nref = "cuph-NVDA-15s-2026-09-02-rim9"
+    tr.contracts = {s: NS(symbol=s) for s in ("ALMS", "NVDA", "QQQ")}
+    tr.open_real = {ref: dict(sym="ALMS", qty=2467, stop=10.52)}
+    tr.brackets = {ref: {}, nref: {}}
+    tr._parent_trades = {11: NS(orderStatus=NS(filled=2467)), 21: NS(orderStatus=NS(filled=0))}
+    def o(sym, ref_, otype, qty, pid):
+        return NS(contract=NS(symbol=sym), orderStatus=NS(status="Submitted", filled=0),
+                  order=NS(orderRef=ref_, action="SELL", orderType=otype, totalQuantity=qty, parentId=pid))
+    book = [o("ALMS", ref, "LMT", 2552, 11),                        # oversized TP, no stop at all
+            o("NVDA", nref, "STP", 300, 21), o("NVDA", nref, "LMT", 300, 21),   # RESTING bracket's children
+            o("QQQ", "TF-QQQ-1", "STP", 100, 0)]                     # tight-flag's, not ours
+    placed = []
+
+    class FakeIB:
+        def positions(self):
+            return [NS(contract=NS(symbol="ALMS"), position=2467), NS(contract=NS(symbol="QQQ"), position=100)]
+        def openTrades(self): return book
+        def placeOrder(self, c, o_): placed.append(o_); return NS(orderStatus=NS(status="Submitted"), log=[], fillEvent=_Ev())
+        def cancelOrder(self, o_): cancelled.append(o_.orderRef)
+    tr.ib = FakeIB()
+    tr.guard_brackets()
+    assert len(placed) == 1 and placed[0].orderType == "STP" and placed[0].totalQuantity == 2467
+    assert abs(placed[0].auxPrice - 10.52) < 1e-9
+    assert placed[0].ocaGroup == ref and placed[0].orderRef == ref, "repair joins the bracket's OCA group"
+    assert cancelled == [ref], f"only the oversized ALMS take-profit may be cancelled, got {cancelled}"
+    assert sum("🚨" in l for l in said) == 2
+    assert sum("QQQ: account shows +100 sh, my book 0" in l for l in said) == 1
+    tr.guard_brackets()                                              # nothing new, no repeat noise
+    assert sum("QQQ: account shows" in l for l in said) == 1
+    # the book went flat (TP filled the rest) but a stop is still working -> orphan, cancelled
+    tr.open_real = {}
+    book[:] = [o("ALMS", ref, "STP", 2467, 0)]
+    tr.guard_brackets()
+    assert cancelled[-1] == ref and any("orphan" in l for l in said)
 
 
 # --------------------------------------------------------------------------- runner

@@ -11,7 +11,8 @@ Sources, all point-in-time:
   * IBKR executions (reqExecutions serves TODAY only -> saved to data/executions/<day>.csv
     the first time, then read from disk forever)
   * logs/live_<day>.log for each bracket's trigger/stop (the 🛡️ and 🔧 lines)
-  * data/paper_fills.csv for which bracket leg fired (TP / SL)
+  * data/paper_fills.csv for which bracket leg fired (TP / SL / EOD — since 2026-09-03 the
+    EOD close carries the bracket's ref too, so it needs no FIFO guess)
   * cache/ibkr15s/<SYM>/<day>.json for the path between entry and exit (pulled if missing)
 
 EOD closes are plain market orders (no orderRef): they are matched to open bracket
@@ -149,16 +150,18 @@ def main() -> None:
         entry, qty = vwap(buys)
         t_in = min(b[2] for b in buys)
         sold = sum(s_[0] for s_ in sells)
-        leg = "TP" if "TP" in legs.get(ref, set()) else "STOP" if "SL" in legs.get(ref, set()) else ""
+        ks = legs.get(ref, set())                       # legs that filled under this ref (TP / SL / EOD)
+        leg = "+".join(n for n, k in (("TP", "TP"), ("STOP", "SL"), ("EOD", "EOD")) if k in ks)
         exits = list(sells)
         kind = leg or ("TP" if sells and vwap(sells)[0] > entry else "STOP" if sells else "")
-        if sold < qty:                                  # the rest closed by the EOD market flatten
+        if sold < qty:                                  # the rest closed by a no-ref market flatten (pre 09-03)
             got = take_loose(sym, t_in, qty - sold, "SLD")
             if not got and not exits:
                 trades.append(dict(symbol=sym, note=f"OPEN — no exit found for {qty} sh", entry=entry))
                 continue
             exits += got
-            kind = f"{leg}+EOD" if (leg and got) else ("EOD" if got else kind)
+            if got:
+                kind = leg + "+EOD" if (leg and "EOD" not in leg) else (leg or "EOD")
         exit_px, _ = vwap(exits)
         t_out = max(e_[2] for e_ in exits)
         # bracket levels: the latest arm/update for this symbol at or before the entry fill

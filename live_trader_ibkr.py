@@ -21,10 +21,15 @@ of rim+$0.01 (plus real spread/gap-through), not at wherever the bar happened to
 LIFECYCLE per setup:
   PRE-ARM   valid cup + forming handle + next bar may legally enter -> place native IBKR bracket:
             BUY-STOP parent @ rim+$0.01, OCA children: take-profit LMT @ +tp*R, stop-loss STP @ handle low
-  UPDATE    each closed bar while forming: handle low drifts down -> modify stop leg, resize qty, move target
+  UPDATE    each closed bar while forming: handle low drifts down -> cancel + re-place the (unfilled)
+            bracket under a NEW ref (IBKR 10326: OCA children cannot be revised in place)
   CANCEL    handle invalidates (deeper than 20% of cup, or too old) -> cancel the pending bracket
-  FILL      logged to data/paper_fills.csv with slippage vs the intended level  <- THE measurement
-  FLATTEN   EOD 15:49 or Ctrl-C -> cancel everything + close all positions
+  FILL      logged to data/paper_fills.csv with slippage vs the intended level  <- THE measurement.
+            ARMED "entered" = what IBKR FILLED (never what the bar looked like): a breakout bar with
+            no fill gets one bar of grace, then the bracket is cancelled + logged as MISSED FILL.
+  WATCHDOG  every 30s: every share on OUR book has a working stop, no exit is larger than the book,
+            a flat book has no exit orders left (own-book only — never the account view)
+  FLATTEN   EOD 15:49 or Ctrl-C -> cancel MY orders + close MY book (one market close per ref)
 
 ONE PENDING PER SYMBOL across all timeframes — the live equivalent of the backtest's cross-
 timeframe dedup, and the guard against the same breakout being bought twice on 1min AND 5min.
@@ -56,6 +61,7 @@ BACKTESTED_TFS = {"1min", "2min", "5min"}
 EOD = dtime(15, 49)
 LIVE_PORTS = {4001, 7496}
 FILLS_CSV = "data/paper_fills.csv"
+DONE_STATES = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
 OPEN_MIN = 9 * 60 + 30                  # 09:30 in minutes — aggregation anchor
 
 
@@ -124,6 +130,48 @@ def cached_day_bars(sym: str, day: str):
         return None
     rows = json.load(open(p))
     return [_CachedBar(r) for r in rows] + [_CachedBar(rows[-1])] if rows else None   # +1: ingest drops the forming last bar
+
+
+MIN_PRICE = 15.0
+# THE OLD UNIVERSE RULES, applied live to every ticker the watchlist hands us (user 2026-09-02).
+# IBKR contract details carry the classification (industry / category / stockType).
+COMMODITY_INDUSTRIES = {"Basic Materials"}                       # mining, steel, chemicals, forest
+COMMODITY_CATEGORIES = {"Oil&Gas", "Oil&Gas Services", "Coal", "Pipelines", "Mining", "Iron/Steel",
+                        "Chemicals", "Forest Products&Paper", "Agriculture", "Metal Fabricate/Hardware"}
+
+
+def universe_verdict(price: float | None, details) -> str:
+    """'' if tradable, else the reason it is dropped. Rules: common stock only (no ETF/ETN/
+    fund), price >= $15, not commodity-related (oil/gas, coal, mining, metals, steel,
+    chemicals, agriculture). Every drop is recorded, never silent."""
+    st = (getattr(details, "stockType", "") or "").upper()
+    if st and st not in ("COMMON", "ADR"):
+        return f"not common stock ({st})"
+    if price is not None and price < MIN_PRICE:
+        return f"price ${price:.2f} < ${MIN_PRICE:.0f} floor"
+    ind = getattr(details, "industry", "") or ""
+    cat = getattr(details, "category", "") or ""
+    if ind in COMMODITY_INDUSTRIES or cat in COMMODITY_CATEGORIES:
+        return f"commodity-related ({ind} / {cat})"
+    return ""
+
+
+def record_universe(day: str, rows: list[dict]) -> None:
+    """Merge rows into data/universe_log.csv by (day, symbol) — the live bot's screen
+    verdicts join record_day.py's history verdicts in one file."""
+    import csv
+    path = "data/universe_log.csv"
+    cols = ["day", "symbol", "sources", "n_sources", "open", "qualified", "reason"]
+    old = []
+    if os.path.exists(path):
+        keys = {(r["day"], r["symbol"]) for r in rows}
+        old = [r for r in csv.DictReader(open(path)) if (r["day"], r["symbol"]) not in keys]
+    os.makedirs("data", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", restval="")
+        w.writeheader()
+        for r in sorted(old + rows, key=lambda x: (x["day"], x["symbol"])):
+            w.writerow(r)
 
 
 def read_watchlist(cli_symbols: str | None, path: str) -> tuple[list[str], str]:
@@ -422,7 +470,13 @@ class Trader:
         self._drawn = 0.0                              # board redraw throttle
         self._last_flatten = 0.0                       # flatten idempotency window
         self._memo: dict[tuple, dict] = {}             # (sym, tf) -> scan_setups memo for the current day
-        self._inflight: dict = {}                      # sym -> working close order (never double-close)
+        self._inflight: dict = {}                      # ref -> working close order (never double-close)
+        self._parent_trades: dict = {}                 # parent orderId -> Trade: is a child LIVE (parent filled)?
+        self._superseded: dict = {}                    # old ref -> new ref after a cancel + re-place (race guard)
+        self.blocked: set = set()                      # symbols the universe screen dropped: never fed, never armed
+        self.unscreened: set = set()                   # started pre-open: the $15 rule waits for today's first bar
+        self.universe_hook = None                      # main() installs: (sym, open_price) -> screen it now
+        self._acct_noted: set = set()                  # (sym, qty) account-vs-book differences already reported
         self.log_path = f"logs/live_{datetime.now(ET):%Y-%m-%d}.log"
 
     # ---- account helpers -------------------------------------------------
@@ -545,41 +599,99 @@ class Trader:
             tr = self.ib.placeOrder(c, o)
             tr.fillEvent += self._fill_logger(name)
             trades[name] = tr
-        self.brackets[ref] = pend                      # levels for fill bookkeeping (updates track pend)
-        return trades
+        self._parent_trades[pid] = trades["ENTRY"]     # children are LIVE only once this parent has filled
+        self.brackets[ref] = dict(pend)                # SNAPSHOT of the levels this ref was placed at (a
+        return trades                                  # re-place gets a new ref; the old keeps its own)
+
+    def _cancel_order(self, order) -> bool:
+        try:
+            self.ib.cancelOrder(order)
+            return True
+        except Exception as ex:
+            self._say(f"  ⚠️ cancel failed for {getattr(order, 'orderRef', '?')}: {ex}")
+            return False
+
+    def _cancel_parent(self, pend, why) -> bool:
+        """Cancel a pending bracket's parent (unfilled children die with it)."""
+        ok = self._cancel_order(pend["trades"]["ENTRY"].order)
+        if not ok:
+            self._say(f"  ⚠️ {pend['ref']} could not be cancelled ({why}) — CHECK IBKR")
+        return ok
+
+    def _entry_filled(self, pend) -> tuple[int, int]:
+        """(shares IBKR has filled on the entry, shares ordered) — the ONLY 'entered' that counts."""
+        tr = pend["trades"]["ENTRY"]
+        return int(getattr(tr.orderStatus, "filled", 0) or 0), int(pend["qty"])
 
     def _fill_logger(self, kind):
+        """OWN-BOOK accounting from IBKR's fills — the only truth about what we hold. Every
+        ref carries its share count: ENTRY adds, TP/SL/EOD subtract, and the trade is closed
+        (tallied) only when the count reaches ZERO. A partial exit (ALMS 2026-09-02: the TP
+        filled 85 of 2,552) leaves the rest on the book, where the watchdog keeps it stopped."""
         def on_fill(trade, fill):
             o = trade.order
-            level = o.lmtPrice if o.orderType == "LMT" else o.auxPrice
-            px = fill.execution.price
+            sym = trade.contract.symbol
+            px = float(fill.execution.price)
+            sh = int(fill.execution.shares)
+            ref = o.orderRef
+            if o.orderType == "MKT":                   # EOD / kill-switch close: cost vs the last known price
+                B = self.store.get((sym, self.base_tf))
+                level = B.c[-1] if B and len(B) else px
+            else:
+                level = o.lmtPrice if o.orderType == "LMT" else o.auxPrice
             slip = (px - level) if o.action == "BUY" else (level - px)   # + = worse than intended
-            self._say(f"  💰 FILL {kind:5} {trade.contract.symbol} {fill.execution.shares:.0f}@${px:.2f} "
-                      f"(level ${level:.2f}, slip {slip*100:+.1f}¢)")
-            br = self.brackets.get(o.orderRef, {})
+            self._say(f"  💰 FILL {kind:5} {sym} {sh}@${px:.2f} (level ${level:.2f}, slip {slip*100:+.1f}¢)")
+            br = self.brackets.get(ref, {})
             now = self._last_t or datetime.now(ET).replace(tzinfo=None)
-            if kind == "ENTRY":                        # position opened -> shows on the board
-                self.open_real[o.orderRef] = dict(sym=trade.contract.symbol, tf=br.get("tf", "?"),
-                                                  entry=px, stop=br.get("stop", level),
-                                                  target=br.get("target", 0.0),
-                                                  trigger=br.get("trigger", level))
-            elif kind in ("TP", "SL"):                 # position closed -> board + day tally
-                pos = self.open_real.pop(o.orderRef, None)
+            if kind == "ENTRY":                        # position opened (or grew) -> on the board
+                pos = self.open_real.get(ref)
+                if pos is None:
+                    pos = self.open_real[ref] = dict(sym=sym, tf=br.get("tf", "?"), entry=px, qty=0,
+                                                     cost=0.0, out=0.0, out_qty=0,
+                                                     stop=br.get("stop", level), target=br.get("target", 0.0),
+                                                     trigger=br.get("trigger", level), ts=now)
+                pos["qty"] += sh
+                pos["cost"] += sh * px
+                pos["entry"] = pos["cost"] / pos["qty"]
+                nxt = self._superseded.get(ref)
+                if nxt:
+                    # RACE (review 2026-09-02): this bracket was cancelled + re-placed for a deeper
+                    # handle, but the fill beat the cancel. Its OCA exits are live at IBKR; the
+                    # successor must never fill too (a double position).
+                    pend = self.pending.get(sym)
+                    if pend and pend["ref"] == nxt and pend["trades"]:
+                        self._cancel_parent(pend, "successor of a bracket that filled during its re-place")
+                        self.pending.pop(sym, None)
+                    self._say(f"  🚨 {sym}: {ref} filled while being re-placed — successor {nxt} cancelled, "
+                              f"the original OCA exits stand")
+            elif kind in ("TP", "SL", "EOD"):          # position shrank -> closed only at zero
+                pos = self.open_real.get(ref)
                 if pos:
-                    risk = pos["trigger"] - pos["stop"]
-                    r = (px - pos["entry"]) / risk if risk > 0 else 0.0
-                    self.closed.append(dict(ts=now, sym=pos["sym"], tf=pos["tf"],
-                                            kind=kind, exit=px, r=r))
+                    pos["qty"] -= sh
+                    pos["out"] += sh * px
+                    pos["out_qty"] += sh
+                    if pos["qty"] <= 0:
+                        self.open_real.pop(ref, None)
+                        exit_px = pos["out"] / pos["out_qty"] if pos["out_qty"] else px
+                        risk = pos["trigger"] - pos["stop"]
+                        r = (exit_px - pos["entry"]) / risk if risk > 0 else 0.0
+                        self.closed.append(dict(ts=now, sym=pos["sym"], tf=pos["tf"], kind=kind,
+                                                exit=exit_px, r=r, entry=pos["entry"],
+                                                trigger=pos["trigger"], stop=pos["stop"], entry_ts=pos["ts"]))
+                    else:
+                        self._say(f"  ↕️ {sym}: {sh} sh out on {kind}, {pos['qty']} sh still on the book "
+                                  f"(stop ${pos['stop']:.2f} — the watchdog keeps it sized)")
             new = not os.path.exists(FILLS_CSV)
             with open(FILLS_CSV, "a") as f:
                 if new:
                     f.write("time,symbol,ref,leg,action,shares,level,fill,slip_cents\n")
-                f.write(f"{fill.time},{trade.contract.symbol},{o.orderRef},{kind},{o.action},"
-                        f"{fill.execution.shares:.0f},{level:.2f},{px:.2f},{slip*100:.1f}\n")
+                f.write(f"{fill.time},{sym},{ref},{kind},{o.action},{sh},{level:.2f},{px:.2f},{slip*100:.1f}\n")
         return on_fill
 
     # ---- pending-setup lifecycle -------------------------------------------
     def arm_pending(self, sym, tf, ri, st, B):
+        if sym in self.blocked:
+            return
         ref = f"cuph-{sym}-{tf}-{B.date}-rim{ri}"
         trigger, stop = round(st["trigger"], 2), round(st["stop"], 2)
         risk = trigger - stop
@@ -609,8 +721,8 @@ class Trader:
                 self._say(f"  SKIP {sym} {tf} — size < 1 share (equity ${eq:,.0f}, risk/sh ${risk:.2f})")
             return
         target = round(trigger + self.a.tp * risk, 2)
-        pend = dict(ri=ri, tf=tf, ref=ref, trigger=trigger, stop=stop, qty=qty, target=target,
-                    trades=None, ts=B.ts[-1])
+        pend = dict(ri=ri, tf=tf, ref=ref, ref0=ref, gen=1, grace=0, trigger=trigger, stop=stop,
+                    qty=qty, target=target, trades=None, ts=B.ts[-1])
         kind = "momentum" if st["momentum"] else "consolidation"
         line = (f"{sym} {tf} buy-stop ${trigger:.2f}  stop ${stop:.2f}  tp ${target:.2f} ({self.a.tp:g}R)  "
                 f"{qty} sh  [{kind}]")
@@ -626,6 +738,8 @@ class Trader:
         new_stop = round(st["stop"], 2)
         if new_stop > pend["stop"] - 0.005:            # stop only ratchets DOWN; ignore sub-cent noise
             return
+        if pend["trades"] and self._entry_filled(pend)[0] > 0:
+            return                                     # already (partly) ours: reconcile settles it, never re-place
         risk = pend["trigger"] - new_stop
         eq = self.equity()
         qty = max(1, int((self.a.risk * eq) / risk)) if eq > 0 else pend["qty"]
@@ -635,27 +749,29 @@ class Trader:
         if pend["trades"]:
             # 2026-09-02: IBKR error 10326 "OCA group revision is not allowed" — a bracket's
             # children can NOT be modified in place (this is why the DUOL stop never moved on
-            # 09-01). The bracket is still unfilled here, so cancel it whole and re-place it.
-            try:
-                self.ib.cancelOrder(pend["trades"]["ENTRY"].order)   # children die with the parent
-            except Exception as ex:
-                self._say(f"  ⚠️ cancel before re-place failed for {pend['ref']}: {ex}")
+            # 09-01). The bracket is unfilled here, so cancel it whole and re-place it under a
+            # NEW ref (= a new OCA group): if the old parent fills inside the cancel's round
+            # trip, the two brackets never share exits, and the fill logger kills the successor.
+            old = pend["ref"]
+            if not self._cancel_parent(pend, "re-place at the deeper stop"):
                 return
+            pend["gen"] += 1
+            pend["ref"] = f"{pend['ref0']}-r{pend['gen']}"
+            self._superseded[old] = pend["ref"]
             pend["trades"] = self.place_bracket(sym, pend)
-            self._say(f"  🔁 bracket re-placed at the new levels (OCA cannot be revised)")
+            self._say(f"  🔁 bracket re-placed as {pend['ref']} (OCA cannot be revised)")
 
     def cancel_pending(self, sym, reason, ts=None):
         pend = self.pending.pop(sym)
         if pend["trades"]:
-            try:
-                self.ib.cancelOrder(pend["trades"]["ENTRY"].order)   # children die with the parent
-            except Exception as ex:
-                self._say(f"  ⚠️ cancel failed for {pend['ref']}: {ex}")
+            self._cancel_parent(pend, reason)
         when = f"{ts:%m-%d %H:%M}  " if ts else ""
         self._say(f"  🗑️ CANCEL {when}{sym} {pend['tf']} pending bracket — {reason}")
 
     def reconcile(self, sym, tf, B):
         """Per closed bar of THIS timeframe: sync the symbol's one pending setup with the scanner."""
+        if sym in self.blocked:
+            return
         pend = self.pending.get(sym)
         if pend and pend["tf"] != tf:
             return                                     # slot held by another timeframe — cross-tf dedup
@@ -663,9 +779,32 @@ class Trader:
         n = len(B)
         if pend:
             st = scan.get(pend["ri"])
+            bar_entered = st is not None and st["state"] == "entered"
+            if self.a.arm and pend["trades"]:
+                # ARMED: "entered" is what IBKR FILLED, never what the bar looked like. The
+                # 2026-09-02 ALMS double position came from popping the pending on the bar's
+                # say-so while the buy-stop still rested (IBKR triggers on quotes, not prints):
+                # a ghost bracket, then a second bracket armed on the next rim.
+                filled, qty = self._entry_filled(pend)
+                if filled >= qty:                      # the whole entry is ours: the OCA exits own it now
+                    self._settle_entry(sym, tf, pend, st, B, filled)
+                    return
+                if bar_entered or filled > 0:
+                    pend["grace"] += 1                 # one bar of grace: a fill lags the bar by seconds
+                    if pend["grace"] <= 1:
+                        return
+                    self._cancel_parent(pend, "grace over — a remainder never rests as a ghost")
+                    if filled > 0:
+                        self._say(f"  ⚠️ {B.ts[-1]:%m-%d %H:%M}  {sym} {tf} PARTIAL entry {filled}/{qty} sh — "
+                                  f"remainder cancelled, the exits cover the filled shares")
+                        self._settle_entry(sym, tf, pend, st, B, filled)
+                    else:
+                        self.pending.pop(sym)
+                        self._missed_fill(sym, tf, pend, B)
+                    return
             if st is None or st["state"] == "dead":
                 self.cancel_pending(sym, "handle invalidated (too deep / too old)", B.ts[-1])
-            elif st["state"] == "entered":
+            elif bar_entered:
                 self.entered_at[(sym, tf)] = st["entry_bar"]
                 est = max(pend["trigger"], B.o[-1])    # gap over the open, else first touch
                 if not self.a.arm:
@@ -674,7 +813,7 @@ class Trader:
                     self.paper.append(dict(sym=sym, tf=tf, entry=est, trigger=pend["trigger"],
                                            stop=pend["stop"], target=pend["target"], ts=B.ts[-1],
                                            hi=est))                     # peak price seen (MFE tracking)
-                self.pending.pop(sym)                  # real mode: the OCA exits own it from here
+                self.pending.pop(sym)                  # shadow: the simulated exits own it from here
             else:
                 self.update_pending(sym, st, B)
         else:
@@ -694,10 +833,129 @@ class Trader:
                     self.arm_pending(sym, tf, ri, st, B)
                     break
 
+    def _settle_entry(self, sym, tf, pend, st, B, filled):
+        """IBKR filled (part of) our entry: the bracket's OCA exits own the position from here."""
+        bar_entered = st is not None and st["state"] == "entered"
+        self.entered_at[(sym, tf)] = st["entry_bar"] if bar_entered else len(B) - 1
+        self.pending.pop(sym, None)
+        if not bar_entered:
+            self._say(f"  💥 {B.ts[-1]:%m-%d %H:%M}  {sym} {tf} entry FILLED at IBKR ({filled} sh) before the "
+                      f"bar showed a breakout (quote-triggered) — exits resting")
+
+    def _missed_fill(self, sym, tf, pend, B):
+        """The bar crossed the trigger, IBKR never filled us (stops trigger on quotes, not on a
+        print). Logged + recorded as a cost-model datapoint — and never left resting."""
+        hi = max(B.h[-2:]) if len(B) >= 2 else B.h[-1]
+        self._say(f"  ❌ MISSED FILL {B.ts[-1]:%m-%d %H:%M}  {sym} {tf} bar high ${hi:.2f} crossed trigger "
+                  f"${pend['trigger']:.2f} but IBKR filled 0 of {pend['qty']} sh — bracket cancelled")
+        try:
+            new = not os.path.exists(FILLS_CSV)
+            with open(FILLS_CSV, "a") as f:
+                if new:
+                    f.write("time,symbol,ref,leg,action,shares,level,fill,slip_cents\n")
+                f.write(f"{B.ts[-1]},{sym},{pend['ref']},MISSED,BUY,0,{pend['trigger']:.2f},{hi:.2f},\n")
+        except OSError:
+            pass
+
     # ---- safety -------------------------------------------------------------
+    def _child_live(self, t) -> bool:
+        """An exit child protects something only once its parent has filled; before that it is
+        part of a RESTING bracket (IBKR shows it PreSubmitted) and must be neither counted
+        as protection nor cancelled as an orphan."""
+        pid = int(getattr(t.order, "parentId", 0) or 0)
+        if not pid:
+            return True
+        par = self._parent_trades.get(pid)
+        return par is None or int(getattr(par.orderStatus, "filled", 0) or 0) > 0
+
+    def guard_brackets(self):
+        """Runs every 30s on the main thread (never inside a stream callback). The invariant
+        the 2026-09-02 ALMS trade broke: every share on OUR book has a WORKING stop, no exit
+        order is larger than the book (an oversized fill flips us short), and a flat book has
+        no exit orders left. OWN BOOK ONLY: ib.positions() also carries the tight-flag robot's
+        shares (and, after a restart, a previous run's) — sizing stops off the account view
+        would sell shares that are not ours. Only THIS session's refs are touched, and only
+        exit children whose parent has filled count (the rest belong to resting brackets).
+        Repairs are fresh orders placed INSIDE the ref's OCA group (10326: no revisions)."""
+        if not self.a.arm or self.a.replay:
+            return
+        try:
+            working = [t for t in self.ib.openTrades()
+                       if t.orderStatus.status in ("PreSubmitted", "Submitted", "PendingSubmit")]
+            acct = {p.contract.symbol: int(p.position) for p in self.ib.positions()
+                    if p.contract.symbol in self.contracts}
+        except Exception as ex:
+            self._say(f"  ⚠️ guard: could not read positions/orders ({ex})")
+            return
+        own, level, ref_of = defaultdict(int), {}, {}
+        for ref, p in self.open_real.items():
+            if p["qty"] > 0:
+                own[p["sym"]] += p["qty"]
+                if p["sym"] not in level or p["stop"] > level[p["sym"]]:   # the tightest stop protects all
+                    level[p["sym"]], ref_of[p["sym"]] = p["stop"], ref
+        mine = [t for t in working if t.order.orderRef in self.brackets and t.order.action == "SELL"
+                and t.order.orderType in ("STP", "LMT") and self._child_live(t)]
+        for sym in sorted(set(own) | {t.contract.symbol for t in mine}):
+            q = own.get(sym, 0)
+            sells = [t for t in mine if t.contract.symbol == sym]
+            if q <= 0:
+                for t in sells:
+                    self._cancel_order(t.order)
+                if sells:
+                    self._say(f"  🧹 guard: {sym} book is flat — cancelled {len(sells)} orphan exit order(s)")
+                continue
+            stops = [t for t in sells if t.order.orderType == "STP"]
+            tps = [t for t in sells if t.order.orderType == "LMT"]
+            remaining = lambda t: int(t.order.totalQuantity - (t.orderStatus.filled or 0))
+            stop_qty, tp_qty = sum(map(remaining, stops)), sum(map(remaining, tps))
+            ref = ref_of[sym]
+            if stop_qty != q:
+                if stop_qty > q:                       # oversized stop: a fill would flip us short
+                    for t in stops:
+                        self._cancel_order(t.order)
+                    stop_qty = 0
+                miss = q - stop_qty
+                o = self.Order(action="SELL", orderType="STP", totalQuantity=miss, auxPrice=level[sym],
+                               tif="DAY", orderRef=ref, ocaGroup=ref, ocaType=2)
+                tr = self.ib.placeOrder(self.contracts[sym], o)
+                tr.fillEvent += self._fill_logger("SL")
+                self._say(f"  🚨 guard: {sym} book {q} sh had {stop_qty} sh of working stop — placed a stop "
+                          f"for {miss} @ ${level[sym]:.2f} inside {ref}'s OCA group")
+            if tp_qty > q:
+                for t in tps:
+                    self._cancel_order(t.order)
+                self._say(f"  🚨 guard: {sym} take-profit size {tp_qty} > book {q} — cancelled "
+                          f"(a fill would have flipped us short); stop stays")
+        for sym, aq in sorted(acct.items()):
+            if aq != own.get(sym, 0) and (sym, aq) not in self._acct_noted:
+                self._acct_noted.add((sym, aq))
+                self._say(f"  ℹ️ {sym}: account shows {aq:+d} sh, my book {own.get(sym, 0)} — the difference "
+                          f"is another robot's or a previous run's; not mine to touch")
+
     def flatten(self, reason):
-        self.ib.reqGlobalCancel()
-        self.pending.clear()
+        """Cancel MY working orders and close MY book — nothing else. Until 2026-09-02 this
+        was reqGlobalCancel + 'close every account position': it also killed the tight-flag
+        robot's orders and sold ITS shares, and a flatten storm then oversold MU into a short.
+        Own-book only now: one market close per ref (attributable in the executions), routed
+        SMART, confirmed later by verify_flatten(). Account positions in our symbols that the
+        book does not explain are shouted, never touched."""
+        import time as _time
+        if self._last_flatten and _time.time() - self._last_flatten < 15:
+            self._say(f"  ↩️ flatten ({reason}) skipped — one is already in flight (closes fill in ms; "
+                      f"ib.positions() lags, and re-placing sells oversold us into a SHORT on 2026-09-02)")
+            return
+        self._last_flatten = _time.time()
+        n_cancel = 0
+        try:
+            for t in self.ib.openTrades():
+                if t.order.orderRef in self.brackets and t.orderStatus.status not in DONE_STATES:
+                    n_cancel += self._cancel_order(t.order)
+        except Exception as ex:
+            self._say(f"  ⚠️ could not list my open orders to cancel them: {ex}")
+        for sym in list(self.pending):                 # a pending whose parent IBKR has not echoed yet
+            pend = self.pending.pop(sym)
+            if pend["trades"]:
+                self._cancel_parent(pend, reason)
         now = self._last_t or datetime.now(ET).replace(tzinfo=None)
         if not self.a.arm and self.paper:              # close shadow positions at their last known price
             for p in self.paper:
@@ -712,48 +970,50 @@ class Trader:
                                         entry=p["entry"], trigger=p["trigger"], stop=p["stop"],
                                         entry_ts=p.get("ts"), mfe=mfe))
             self.paper = []
-        if self.a.arm and self.open_real:              # armed: tally EOD closes at last known price
-            for ref, p in self.open_real.items():
-                B = self.store.get((p["sym"], p["tf"]))
-                px = B.c[-1] if B and len(B) else p["entry"]
-                risk = p["trigger"] - p["stop"]
-                r = (px - p["entry"]) / risk if risk > 0 else 0.0
-                self.closed.append(dict(ts=now, sym=p["sym"], tf=p["tf"], kind="EOD", exit=px, r=r))
-            self.open_real = {}
-        # AUDIT FIND 2026-09-01: ib.positions() hands back the LISTING exchange
-        # (e.g. 'NASDAQ'), which is not an order route — placing on that contract is
-        # rejected by IBKR, silently, and the position survives overnight with its
-        # protective stop already cancelled above. Always route the close via SMART,
-        # and never trust a flatten that IBKR has not confirmed.
-        import time as _time
-        if self._last_flatten and _time.time() - self._last_flatten < 15:
-            self._say(f"  ↩️ flatten ({reason}) skipped — one is already in flight (closes fill in ms; "
-                      f"ib.positions() lags, and re-placing sells oversold us into a SHORT on 2026-09-02)")
-            return
-        self._last_flatten = _time.time()
         closes = []
-        for p in self.ib.positions():
-            if p.position == 0:
-                continue
-            sym = p.contract.symbol
-            inflight = self._inflight.get(sym)
-            if inflight is not None and inflight.orderStatus.status not in ("Filled", "Cancelled", "Inactive", "ApiCancelled"):
-                self._say(f"  ↩️ {sym}: a close is already working ({inflight.orderStatus.status}) — not placing another")
-                continue
-            c = self.contracts.get(sym)
-            if c is None:                              # another robot's position: still close it, routed
-                from ib_async import Stock
-                c = Stock(sym, "SMART", "USD")
-                try:
-                    self.ib.qualifyContracts(c)
-                except Exception:
-                    pass
-            act = "SELL" if p.position > 0 else "BUY"
-            tr = self.ib.placeOrder(c, self.MarketOrder(act, abs(p.position)))
-            self._inflight[sym] = tr
-            closes.append((sym, p.position, tr))
+        if self.a.arm:
+            # AUDIT FIND 2026-09-01: ib.positions() hands back the LISTING exchange (e.g.
+            # 'NASDAQ'), which is not an order route — a close placed on that contract is
+            # rejected silently and the position survives overnight with its stop already
+            # cancelled. Closes go on OUR qualified SMART contract, one per ref, and are
+            # confirmed by verify_flatten(); the EOD fills zero the book like any other exit.
+            for ref, p in list(self.open_real.items()):
+                if p["qty"] <= 0:
+                    continue
+                inflight = self._inflight.get(ref)
+                if inflight is not None and inflight.orderStatus.status not in DONE_STATES:
+                    self._say(f"  ↩️ {p['sym']}: a close is already working ({inflight.orderStatus.status}) "
+                              f"— not placing another")
+                    continue
+                c = self.contracts.get(p["sym"])
+                if c is None:
+                    from ib_async import Stock
+                    c = Stock(p["sym"], "SMART", "USD")
+                    try:
+                        self.ib.qualifyContracts(c)
+                    except Exception:
+                        pass
+                o = self.MarketOrder("SELL", p["qty"])
+                o.orderRef = ref
+                tr = self.ib.placeOrder(c, o)
+                tr.fillEvent += self._fill_logger("EOD")
+                self._inflight[ref] = tr
+                closes.append((p["sym"], p["qty"], tr))
+            own = defaultdict(int)
+            for p in self.open_real.values():
+                own[p["sym"]] += p["qty"]
+            try:
+                for pos in self.ib.positions():
+                    sym = pos.contract.symbol
+                    if pos.position != 0 and sym in self.contracts and int(pos.position) != own.get(sym, 0):
+                        self._say(f"  🚨 {sym}: account holds {pos.position:+.0f} sh, my book {own.get(sym, 0)} — "
+                                  f"NOT mine (another robot / a previous run), not touching it. "
+                                  f"If it is yours, CLOSE IT MANUALLY")
+            except Exception as ex:
+                self._say(f"  ⚠️ could not read account positions: {ex}")
         n = len(closes)
-        self._say(f"  ⛔ FLATTEN ({reason}) — cancelled all orders (incl. pendings), closing {n} position(s)")
+        self._say(f"  ⛔ FLATTEN ({reason}) — cancelled {n_cancel} of my order(s), closing {n} position(s) "
+                  f"({sum(q for _, q, _ in closes)} sh) — own book only")
         self._closes = closes
         if closes and not self._defer(3, self.verify_flatten):
             pass                                       # no event loop running (Ctrl-C path): main sleeps, then verifies
@@ -774,18 +1034,18 @@ class Trader:
     def verify_flatten(self):
         """A flatten is only real once IBKR confirms it. Idempotent."""
         closes, self._closes = getattr(self, "_closes", []), []
+        bad = []
         for sym, qty, tr in closes:
             st = tr.orderStatus.status
             why = f" — {tr.log[-1].message}" if st != "Filled" and tr.log else ""
             self._say(f"  {'✅' if st == 'Filled' else '🚨'} close {sym} {qty:+.0f} sh: {st}{why}")
-        try:
-            left = [p for p in self.ib.positions() if p.position != 0]
-        except Exception as ex:
-            self._say(f"  ⚠️ could not read positions to confirm the flatten: {ex}")
-            return
-        if left:
-            self._say("  🚨 STILL OPEN after flatten — CLOSE MANUALLY NOW: "
-                      + ", ".join(f"{p.contract.symbol} {p.position:+.0f}" for p in left))
+            if st != "Filled":
+                bad.append(f"{sym} {qty:+.0f}")
+        for ref, p in self.open_real.items():          # on the book with no close working at all
+            if p["qty"] > 0 and self._inflight.get(ref) is None:
+                bad.append(f"{p['sym']} {p['qty']:+d} (no close placed)")
+        if bad:
+            self._say("  🚨 STILL OPEN after flatten — CLOSE MANUALLY NOW: " + ", ".join(bad))
 
     # ---- bar pipeline ----------------------------------------------------------
     def on_closed_bar(self, sym, tf, t, o, h, l, c, v) -> bool:
@@ -807,6 +1067,15 @@ class Trader:
         if tf == self.base_tf and t.date() != self.cur_day:   # new session -> re-open the trading day
             self.cur_day = t.date()
             self.eod_done = False
+        if (self._report and tf == self.base_tf and len(B) == 1 and sym in self.unscreened
+                and self.universe_hook is not None):
+            self.unscreened.discard(sym)               # started pre-open: the $15 rule waits for today's open
+            try:
+                self.universe_hook(sym, o)
+            except Exception as ex:
+                self._say(f"  ⚠️ universe re-check failed for {sym}: {ex}")
+            if sym in self.blocked:
+                return True
         if self._report and tf == self.base_tf:        # proof-of-life: silence must never be ambiguous
             self._last_t = t
             if not self.live_started:
@@ -901,7 +1170,7 @@ class Trader:
         """ONE closed BASE bar (15s in the program / 1min legacy) from ANY source ->
         the base pipeline, then (minute base only) the local k-min aggregators.
         Duplicates are dropped so sources can safely overlap."""
-        if not (dtime(9, 30) <= t.time() <= dtime(16, 0)):
+        if not (dtime(9, 30) <= t.time() <= dtime(16, 0)) or sym in self.blocked:
             return
         if not self.on_closed_bar(sym, self.base_tf, t, o, h, l, c, v):
             return                                     # duplicate -> don't double-feed the aggregators
@@ -1036,6 +1305,58 @@ def main():
         print("  REPLAY MODE — walking the most recent COMPLETED session. ⚠️ run BEFORE ~16:15 ET and "
               "that is the PREVIOUS trading day, not today. All times below belong to that session.\n")
     skipped = []
+    universe_rows: list[dict] = []
+    try:                                               # source tags from the export (###CNBC …)
+        from record_day import parse_sources
+        _exp = resolve_watchlist(a.watchlist) if not a.symbols else None
+        SOURCES = parse_sources(_exp) if _exp else {}
+    except Exception:
+        SOURCES = {}
+
+    SEEDS: dict = {}                                   # symbol -> its live BarDataList (to detach on a drop)
+    DETAILS: dict = {}                                 # symbol -> IBKR ContractDetails (stockType/industry)
+
+    def drop_symbol(s: str, why: str, say=print, bl=None) -> None:
+        """Take a symbol out of the run — at the seed, or on today's first bar."""
+        if s not in skipped:
+            skipped.append(s)
+        bot.blocked.add(s)
+        bot.unscreened.discard(s)
+        bot.contracts.pop(s, None)
+        for k_ in [k_ for k_ in bot.store if k_[0] == s]:
+            bot.store.pop(k_, None)
+        bl = bl if bl is not None else SEEDS.pop(s, None)
+        if bl is not None:
+            try:
+                bl.updateEvent -= on_update
+            except Exception:
+                pass
+            try:
+                ib.cancelHistoricalData(bl)
+            except Exception:
+                pass
+        say(f"  🚫 {s}: DROPPED — {why}")
+
+    def note_universe(s: str, price, why: str) -> dict:
+        """The day's verdict row for this symbol (a re-check on today's open replaces it)."""
+        srcs = SOURCES.get(s, [])
+        row = {"day": f"{datetime.now(ET):%Y-%m-%d}", "symbol": s, "sources": "+".join(srcs),
+               "n_sources": len(srcs), "open": f"{price:.2f}" if price is not None else "",
+               "qualified": "no" if why else "yes", "reason": why}
+        universe_rows[:] = [r for r in universe_rows if r["symbol"] != s] + [row]
+        return row
+
+    def universe_hook(sym: str, open_px: float) -> None:
+        """Pre-open start: the seed had no bar of today, so the $15 rule could not run. It
+        runs HERE, on today's first bar — before any cup can possibly form (>= 19 bars)."""
+        why = universe_verdict(open_px, DETAILS.get(sym))
+        row = note_universe(sym, open_px, why)
+        record_universe(row["day"], [row])
+        if why:
+            drop_symbol(sym, why, bot._say)
+        else:
+            bot._say(f"  ✅ {sym}: opened ${open_px:.2f} — passes the universe screen")
+    bot.universe_hook = universe_hook
 
     def setup_symbol(s: str, say=print) -> bool:
         """Bring ONE symbol online: qualify, seed history, attach the stream. Used at
@@ -1063,30 +1384,66 @@ def main():
         cached = cached_day_bars(s, a.day) if (a.replay and a.day and base_tf == "15s") else None
         if cached is not None:
             bl = cached                                # replay from disk: seconds, not minutes
+        elif a.replay and a.day:                       # cache miss on a NAMED day: pull THAT day, never "latest"
+            end = datetime.fromisoformat(a.day).replace(hour=23, minute=59, tzinfo=ET)
+            bl = ib.reqHistoricalData(c, endDateTime=end, durationStr="1 D", barSizeSetting=bar_size,
+                                      whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=False)
         else:
             bl = ib.reqHistoricalData(c, endDateTime="", durationStr=seed_dur, barSizeSetting=bar_size,
                                       whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=stream)
+        live_bl = bl if (stream and cached is None) else None
+        if not len(bl):                                # halted / delisted / never printed: nothing to trade
+            drop_symbol(s, "no bars served (halted or not trading)", say, live_bl)
+            return False
         feed = bl
-        if a.replay and len(bl):                       # replay ONLY the most recent session in the window
-            def _d(x):
-                return x.date.astimezone(ET).date() if hasattr(x.date, "astimezone") else x.date.date()
-            last_day = max(_d(x) for x in bl)
-            feed = [x for x in bl if _d(x) == last_day]
+        ref_day = datetime.now(ET).date()              # the day whose OPEN the $15 rule is judged on
+        def _d(x):
+            return x.date.astimezone(ET).date() if hasattr(x.date, "astimezone") else x.date.date()
+        if a.replay:                                   # replay ONLY the most recent session in the window
+            ref_day = max(_d(x) for x in bl)
+            feed = [x for x in bl if _d(x) == ref_day]
+        # ---- THE UNIVERSE SCREEN: price >= $15, common stock, not commodity (old rules) ----
+        # Judged on the DAY's open, BEFORE the bars are walked (a replay walks the whole day
+        # on ingest — screening afterwards left the dropped names' trades in the summary).
+        # Before the open the price is unknown (yesterday's close is not the rule and dropped
+        # a name for good) -> the $15 rule re-runs on today's first bar (universe_hook).
+        first = next((x for x in feed if _d(x) == ref_day), None)
+        price = float(first.open) if first is not None else None
+        try:
+            cds = ib.reqContractDetails(c)
+            DETAILS[s] = cds[0] if cds else None
+        except Exception:
+            DETAILS[s] = None
+        why = universe_verdict(price, DETAILS[s])
+        if not a.replay:                               # replay screens but records nothing (history is
+            note_universe(s, price, why)               # record_day.py's; today's rows are the live bot's)
+        if why:
+            drop_symbol(s, why, say, live_bl)
+            return False
+        if price is None and not a.replay:
+            bot.unscreened.add(s)                      # pre-open start: judged on today's first bar
         was_live = bot._report
         bot.ingest(s, feed, report=a.replay)           # replay: walk that session with full lifecycle prints
-        bot._report = was_live or a.replay
+        bot._report = was_live or a.replay             # a mid-session seed must not silence the live board
         if a.replay:
             for tf_ in tfs:
-                bot.referee_once(s, tf_)               # once per symbol-day instead of once per bar             # a mid-session seed must not silence the live board
+                bot.referee_once(s, tf_)               # once per symbol-day instead of once per bar
         seeded = " ".join(f"{len(bot.store.get((s, t), []))} {t}" for t in tfs)
-        if stream and cached is None:
+        if live_bl is not None:
             bl.updateEvent += on_update
             seeds.append((s, bl))
-        say(f"  {s}: seeded {seeded} bars" + (" (from cache)" if cached is not None else ""))
+            SEEDS[s] = bl
+        say(f"  {s}: seeded {seeded} bars" + (" (from cache)" if cached is not None else "")
+            + (" — $15 rule runs on today's open" if price is None and not a.replay else ""))
         return True
 
     for s in syms:
         setup_symbol(s)
+    if universe_rows:
+        record_universe(universe_rows[0]["day"], universe_rows)
+        print(f"  📚 universe verdicts recorded -> data/universe_log.csv "
+              f"({sum(1 for r in universe_rows if r['qualified'] == 'yes')} tradable, "
+              f"{sum(1 for r in universe_rows if r['qualified'] == 'no')} dropped with reasons)")
     if skipped:
         syms = [s for s in syms if s not in skipped]
         print(f"\n  ⚠️ {len(skipped)} symbol(s) skipped: {', '.join(skipped)} — trading {len(syms)}")
@@ -1196,9 +1553,17 @@ def main():
             if not new:
                 return
             bot._say(f"  🧩 {now:%H:%M} watchlist grew — adding {', '.join(new)}")
+            try:
+                from record_day import parse_sources
+                SOURCES.update(parse_sources(path))
+            except Exception:
+                pass
             for s_ in new:
                 if setup_symbol(s_, say=bot._say):
                     syms.append(s_)
+            fresh = [r for r in universe_rows if r["symbol"] in new]
+            if fresh:
+                record_universe(fresh[0]["day"], fresh)
             archive_watchlist(path)                    # the day's archive = the day's final list
         except Exception as ex:
             bot._say(f"  ⚠️ hot-add failed ({type(ex).__name__}: {ex}) — still trading the current list")
@@ -1208,6 +1573,7 @@ def main():
             while True:
                 ib.sleep(max(30, len(syms) * 12))     # re-sized: hot_add can grow the list
                 hot_add()
+                bot.guard_brackets()
                 for s in list(syms):
                     pl = ib.reqHistoricalData(bot.contracts[s], endDateTime="", durationStr="1 D",
                                               barSizeSetting=bar_size, whatToShow="TRADES",
@@ -1217,6 +1583,7 @@ def main():
             while True:                                # ib.sleep keeps the event loop (streams) running
                 ib.sleep(30)
                 hot_add()
+                bot.guard_brackets()
     except KeyboardInterrupt:
         print("\n⛔ kill-switch — flattening…")
         bot.flatten("kill-switch")
