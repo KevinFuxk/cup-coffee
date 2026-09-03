@@ -322,6 +322,11 @@ def test_flatten_routes_via_smart_and_verifies():
     tr.verify_flatten()
     assert any("✅ close DUOL +247" in l for l in said), said
     assert any("STILL OPEN" in l for l in said), "an unconfirmed position must be shouted"
+    # 2026-09-02 storm: 74 flattens in 30s oversold into a SHORT. A second flatten inside
+    # the in-flight window must place NOTHING.
+    tr.flatten("EOD 15:49")
+    assert len(placed) == 1, "re-fired flatten must not place a second close"
+    assert any("already in flight" in l for l in said)
 
 
 def test_tv_export_recognized_by_content_not_name():
@@ -351,6 +356,37 @@ def test_hot_add_is_additive_and_fresh_only():
     os.utime(p, (old, old))                                                    # yesterday's export
     assert watchlist_additions({"NVDA"}, p, today) == [], "a stale export must inject nothing"
     assert watchlist_additions({"NVDA"}, None, today) == []
+
+
+def test_scan_memo_is_exactly_equivalent_on_a_real_day():
+    """The speed memo must never change a decision: memoized incremental scans over a
+    real cached 15s day must equal the full scan at every sampled prefix."""
+    from live_trader_ibkr import scan_setups
+    from datetime import time as dtime
+    from zoneinfo import ZoneInfo
+    import glob
+    files = sorted(glob.glob("cache/ibkr15s/*/2026-09-01.json"))
+    if not files:
+        print("   (skipped — no cached 15s day)")
+        return
+    p = [f for f in files if "/DUOL/" in f] or files
+    rows = json.load(open(p[0]))
+    ET = ZoneInfo("America/New_York")
+    full = Bars(symbol="X", date=Date(2026, 9, 1), timeframe="15s", ts=[], o=[], h=[], l=[], c=[], v=[])
+    for r in rows:
+        tt = datetime.fromtimestamp(r["t"] / 1000, ET).replace(tzinfo=None)
+        if dtime(9, 30) <= tt.time() <= dtime(15, 59):
+            full.ts.append(tt); full.o.append(r["o"]); full.h.append(r["h"]); full.l.append(r["l"]); full.c.append(r["c"]); full.v.append(r.get("v", 0))
+    d = det(); memo = {}
+    checked = 0
+    for n in range(25, len(full) + 1):
+        pre = Bars(symbol="X", date=full.date, timeframe="15s", ts=full.ts[:n], o=full.o[:n],
+                   h=full.h[:n], l=full.l[:n], c=full.c[:n], v=full.v[:n])
+        inc = scan_setups(d, pre, memo)                # incremental, memo carried bar to bar
+        if n % 37 == 0 or n == len(full):              # full re-scan is the slow reference
+            assert inc == scan_setups(d, pre), f"memo diverged from the full scan at n={n}"
+            checked += 1
+    print(f"   (memo == full scan at {checked} prefixes of a {len(full)}-bar real day)")
 
 
 # --------------------------------------------------------------------------- runner

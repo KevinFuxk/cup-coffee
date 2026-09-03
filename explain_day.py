@@ -15,6 +15,7 @@ Reads bars from IB Gateway (paper, port 4002). Places no orders, touches no data
 """
 from __future__ import annotations
 
+import os
 import sys
 from datetime import date as Date, time as dtime
 from zoneinfo import ZoneInfo
@@ -120,13 +121,18 @@ def main():
 
     for sym in syms:
         c = Stock(sym, "SMART", "USD")
-        try:
-            ib.qualifyContracts(c)
-            bl = ib.reqHistoricalData(c, endDateTime="", durationStr="2 D", barSizeSetting="15 secs",
-                                      whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=False)
-        except Exception as e:
-            print(f"{sym}: data unavailable ({type(e).__name__})\n")
-            continue
+        cpath = f"cache/ibkr15s/{sym}/{day}.json" if day else None
+        if cpath and os.path.exists(cpath):            # SPEED: the evening cache already has the day
+            from live_trader_ibkr import cached_day_bars
+            bl = cached_day_bars(sym, day)[:-1]
+        else:
+            try:
+                ib.qualifyContracts(c)
+                bl = ib.reqHistoricalData(c, endDateTime="", durationStr="2 D", barSizeSetting="15 secs",
+                                          whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=False)
+            except Exception as e:
+                print(f"{sym}: data unavailable ({type(e).__name__})\n")
+                continue
         if not bl:
             print(f"{sym}: no bars returned\n")
             continue

@@ -23,8 +23,20 @@ PY = sys.executable
 LEDGER, HTML = "data/replay_trades.csv", "data/replay_trades.html"
 
 
+def session_day() -> str:
+    """The completed session being recorded: today after the close, else the last weekday."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    d = now.date() if now.hour >= 16 else now.date() - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.isoformat()
+
+
 def run_replays():
-    base = [PY, "live_trader_ibkr.py", "--replay", "--tfs", "15s", "--port", "4002", "--client-id", "9"]
+    base = [PY, "live_trader_ibkr.py", "--replay", "--tfs", "15s", "--port", "4002", "--client-id", "9",
+            "--day", session_day()]
     for ms in ("0.25", "0"):
         print(f"=== replay with min-stop {ms}% ===", flush=True)
         r = subprocess.run(base + ["--minstop", ms], capture_output=True, text=True)
@@ -137,7 +149,7 @@ function F(){{const v=fv.value,s=fs.value;for(const r of tb.rows)
 def explain():
     """Why each watched symbol did or didn't trade — the gate that rejected each cup."""
     print("\n" + "=" * 70)
-    r = subprocess.run([PY, "explain_day.py"], capture_output=True, text=True)
+    r = subprocess.run([PY, "explain_day.py", session_day()], capture_output=True, text=True)
     out = "\n".join(l for l in r.stdout.splitlines() if l.strip())
     print(out if out else "  (explain_day.py produced no output — is IB Gateway running?)")
 
@@ -145,13 +157,24 @@ def explain():
 def cache_bars():
     """Accumulate the private 15s story-stock dataset — the data money can't buy."""
     print("=" * 70)
-    r = subprocess.run([PY, "cache_15s.py"], capture_output=True, text=True)
+    r = subprocess.run([PY, "cache_15s.py", session_day()], capture_output=True, text=True)
     for l in r.stdout.splitlines()[-6:]:
         print(l)
 
 
+def real_ledger():
+    """The ARMED trades — real fills from IBKR, peak R from the cached bars."""
+    print("=" * 70)
+    r = subprocess.run([PY, "real_ledger.py", session_day()], capture_output=True, text=True)
+    for l in r.stdout.splitlines()[-14:]:
+        print(l)
+    if r.returncode != 0:
+        print(r.stderr[-600:])
+
+
 if __name__ == "__main__":
+    cache_bars()        # ONE IBKR pull per symbol; everything below reads from disk
     run_replays()
+    real_ledger()
     build_html()
-    cache_bars()
     explain()

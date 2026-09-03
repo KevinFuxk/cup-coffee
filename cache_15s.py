@@ -34,7 +34,9 @@ def latest_archived_watchlist() -> str | None:
 
 
 def main() -> None:
-    cli = sys.argv[1] if len(sys.argv) > 1 else None
+    args = [a for a in sys.argv[1:]]
+    day_arg = next((a for a in args if a[:4].isdigit()), None)
+    cli = next((a for a in args if not a[:4].isdigit()), None)
     src = latest_archived_watchlist()
     syms, where = read_watchlist(cli, src or "auto")
     print(f"caching 15s bars for {len(syms)} symbol(s) from {where}")
@@ -52,6 +54,9 @@ def main() -> None:
 
     saved = skipped = failed = 0
     for sym in syms:
+        if day_arg and os.path.exists(f"{OUT}/{sym}/{day_arg}.json"):
+            skipped += 1                               # already on disk: no IBKR pull at all
+            continue
         c = Stock(sym, "SMART", "USD")
         try:
             ib.qualifyContracts(c)
@@ -80,7 +85,7 @@ def main() -> None:
         json.dump(rows, open(path, "w"))
         print(f"  {sym}: {len(rows)} bars -> {path}")
         saved += 1
-        ib.sleep(2)                                    # IBKR pacing
+        ib.sleep(1)                                    # IBKR pacing
     ib.disconnect()
     print(f"done: {saved} saved, {skipped} already cached, {failed} failed")
 

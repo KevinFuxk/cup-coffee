@@ -108,6 +108,24 @@ def watchlist_additions(known: set[str], path: str | None, today) -> list[str]:
     return [x for x in syms if x not in known]
 
 
+class _CachedBar:
+    """Looks enough like an ib_async BarData for ingest(): .date (tz-aware), o/h/l/c/volume."""
+    __slots__ = ("date", "open", "high", "low", "close", "volume")
+    def __init__(self, r):
+        self.date = datetime.fromtimestamp(r["t"] / 1000, ET)
+        self.open, self.high, self.low, self.close, self.volume = r["o"], r["h"], r["l"], r["c"], r.get("v", 0)
+
+
+def cached_day_bars(sym: str, day: str):
+    """The day's 15s bars from cache/ibkr15s (cache_15s.py / record_day.py write them), or None."""
+    import json
+    p = f"cache/ibkr15s/{sym}/{day}.json"
+    if not os.path.exists(p):
+        return None
+    rows = json.load(open(p))
+    return [_CachedBar(r) for r in rows] + [_CachedBar(rows[-1])] if rows else None   # +1: ingest drops the forming last bar
+
+
 def read_watchlist(cli_symbols: str | None, path: str) -> tuple[list[str], str]:
     """Where the day's tickers come from, in priority order:
          1. symbols typed on the command line
@@ -191,7 +209,7 @@ def archive_watchlist(path: str | None) -> None:
     print(f"  📚 watchlist archived -> {dst}")
 
 
-def scan_setups(det: PatternDetector, b: Bars) -> dict[int, dict]:
+def scan_setups(det: PatternDetector, b: Bars, memo: dict | None = None) -> dict[int, dict]:
     """Every cup setup and the CURRENT state of its handle, keyed by right-rim index.
 
     Mirrors _find_cup + _find_handle EXACTLY (same gates, same walk) but does not require the
@@ -204,22 +222,43 @@ def scan_setups(det: PatternDetector, b: Bars) -> dict[int, dict]:
     """
     n = len(b)
     out: dict[int, dict] = {}
+    # SPEED (2026-09-02): a left rim's outcome is FINAL once its cup+handle is dead, entered,
+    # or symmetry-failed — later bars cannot change bars that already printed. `memo`
+    # (per symbol-day, owned by the caller) remembers those, so each new bar re-examines
+    # only rims that are still forming or still cup-less. Results are identical to the
+    # full scan (tests prove it on a real day); the replay went from ~45 min to seconds.
     for li in range(1, n - 1):
+        if memo is not None and li in memo:
+            fin = memo[li]
+            if fin is not None:
+                ri_f, st_f = fin
+                if ri_f not in out:
+                    out[ri_f] = st_f
+            continue
         if not _is_peak(b, li):
+            if memo is not None and li < n - 2:        # peak-ness of an interior bar never changes
+                memo[li] = None
             continue
         min_ri = 0
         while True:                                    # ROLLING RIM (user spec 2026-07-20): a pre-entry
-            cup = det._find_cup(b, li, min_ri)         # bar above the rim dethrones it -> re-search for
-            if cup is None:                            # the next peak-confirmed rim that re-passes gates
+            if memo is not None and min_ri == 0:       # bar above the rim dethrones it -> re-search for
+                cup = _find_cup_resumable(det, b, li, memo)   # the next peak-confirmed rim that re-passes gates
+            else:
+                cup = det._find_cup(b, li, min_ri)
+            if cup is None:
                 break
             bottom_idx, ri = cup
             cup_low = b.l[bottom_idx]
             rim, lip = b.h[ri], b.h[li]
             depth_h = rim - cup_low
             if depth_h <= 0:
+                if memo is not None:
+                    memo[li] = None                    # final: this rim never yields a cup
                 break
             _d = min if det.rim_mode == "min" else max     # rim symmetry, same as _find_handle
             if abs(rim - lip) >= det.rim_recov * _d(lip - cup_low, rim - cup_low):
+                if memo is not None:
+                    memo[li] = None                    # final: symmetry fail on its first valid rim
                 break                                  # symmetry fail = this li is done (detector parity)
             trigger = rim + det.entry_off
             # USER SPEC 2026-07-23: no momentum fast-lane under the rolling rim — 4-bar floor always
@@ -242,11 +281,63 @@ def scan_setups(det: PatternDetector, b: Bars) -> dict[int, dict]:
                 continue
             if state is None:                          # walk ran out of bars
                 state = "dead" if (det.h_max and n >= ri + det.h_max) else "forming"
+            st = dict(state=state, trigger=trigger, stop=hl, earliest=earliest,
+                      entry_bar=entry_bar, momentum=momentum)
             if ri not in out:                          # first successful li wins (detector order)
-                out[ri] = dict(state=state, trigger=trigger, stop=hl, earliest=earliest,
-                               entry_bar=entry_bar, momentum=momentum)
+                out[ri] = st
+            if memo is not None and state in ("dead", "entered"):
+                memo[li] = (ri, st)                    # final: printed bars cannot un-die or un-enter
             break
     return out
+
+
+def _find_cup_resumable(det: PatternDetector, b: Bars, li: int, memo: dict):
+    """det._find_cup(b, li, 0), resumed bar to bar. For a left rim with no valid right rim
+    yet, the only right-rim candidate a NEW bar can add is ri = n-2 (a bar is peak-eligible
+    only once its right neighbour exists); every earlier ri was rejected on bars that have
+    not changed, and the running cup bottom is carried along. Identical output to the full
+    scan — the equivalence test proves it on a real day."""
+    key = ("cup", li)
+    st = memo.get(key)
+    n = len(b)
+    if st is None:                                     # first look: run the real thing once
+        cup = det._find_cup(b, li, 0)
+        if cup is not None:
+            memo[key] = ("found", cup)
+            return cup
+        # nothing yet: remember the interior bottom over (li, n-2] and where to resume
+        lo, lo_i = float("inf"), li
+        for j in range(li + 1, n - 1):
+            if b.l[j] < lo:
+                lo, lo_i = b.l[j], j
+        memo[key] = ("none", n - 1, lo, lo_i)         # next ri to examine = n-1 (eligible next bar)
+        return None
+    if st[0] == "found":
+        return st[1]
+    _, next_ri, lo, lo_i = st
+    left_high = b.h[li]
+    cup = None
+    for ri in range(next_ri, n - 1):                   # only the newly eligible right rims
+        j = ri - 1
+        if j >= li + 1 and b.l[j] < lo:
+            lo, lo_i = b.l[j], j
+        if ri - li < det.cup_min or not _is_peak(b, ri):
+            continue
+        depth = left_high - lo
+        if depth <= 0:
+            continue
+        rh = b.h[ri]
+        if rh < left_high - det.rim_recov * depth or rh > left_high + det.rim_recov * depth:
+            continue
+        if det._obstructed(b, li, left_high, ri, rh):
+            continue
+        cup = (lo_i, ri)
+        break
+    if cup is not None:
+        memo[key] = ("found", cup)
+        return cup
+    memo[key] = ("none", n - 1, lo, lo_i)
+    return None
 
 
 class MinuteAggregator:
@@ -329,6 +420,9 @@ class Trader:
         self.brackets: dict = {}                       # orderRef -> bracket levels (for fill bookkeeping)
         self._last_t = None                            # latest live bar content time (board header)
         self._drawn = 0.0                              # board redraw throttle
+        self._last_flatten = 0.0                       # flatten idempotency window
+        self._memo: dict[tuple, dict] = {}             # (sym, tf) -> scan_setups memo for the current day
+        self._inflight: dict = {}                      # sym -> working close order (never double-close)
         self.log_path = f"logs/live_{datetime.now(ET):%Y-%m-%d}.log"
 
     # ---- account helpers -------------------------------------------------
@@ -430,7 +524,11 @@ class Trader:
 
     # ---- order plumbing ---------------------------------------------------
     def place_bracket(self, sym, pend):
-        """Native IBKR bracket: STP parent + OCA (LMT take-profit / STP stop-loss) children."""
+        """Native IBKR bracket: STP parent + OCA (LMT take-profit / STP stop-loss) children.
+        ocaType=2 (2026-09-02): a PARTIAL fill of one leg REDUCES the other proportionally.
+        With ocaType=1 any fill cancels the sibling outright — ALMS 13:03 today: the TP
+        filled 85 of 2,552 shares, IBKR cancelled the stop, and 2,467 shares rode
+        unprotected from 10.55 to the 10.18 EOD flatten (-12.4R on a 3-cent risk)."""
         c = self.contracts[sym]
         pid = self.ib.client.getReqId()
         ref = pend["ref"]
@@ -438,10 +536,10 @@ class Trader:
                             auxPrice=pend["trigger"], tif="DAY", transmit=False, orderRef=ref)
         tp = self.Order(orderId=self.ib.client.getReqId(), action="SELL", orderType="LMT",
                         totalQuantity=pend["qty"], lmtPrice=pend["target"], tif="DAY", parentId=pid,
-                        transmit=False, orderRef=ref, ocaGroup=ref, ocaType=1)
+                        transmit=False, orderRef=ref, ocaGroup=ref, ocaType=2)
         sl = self.Order(orderId=self.ib.client.getReqId(), action="SELL", orderType="STP",
                         totalQuantity=pend["qty"], auxPrice=pend["stop"], tif="DAY", parentId=pid,
-                        transmit=True, orderRef=ref, ocaGroup=ref, ocaType=1)
+                        transmit=True, orderRef=ref, ocaGroup=ref, ocaType=2)
         trades = {}
         for name, o in (("ENTRY", parent), ("TP", tp), ("SL", sl)):
             tr = self.ib.placeOrder(c, o)
@@ -479,30 +577,6 @@ class Trader:
                 f.write(f"{fill.time},{trade.contract.symbol},{o.orderRef},{kind},{o.action},"
                         f"{fill.execution.shares:.0f},{level:.2f},{px:.2f},{slip*100:.1f}\n")
         return on_fill
-
-    def modify_bracket(self, pend):
-        try:
-            for name, tr in pend["trades"].items():
-                o = tr.order
-                o.totalQuantity = pend["qty"]
-                if name == "SL":
-                    o.auxPrice = pend["stop"]
-                if name == "TP":
-                    o.lmtPrice = pend["target"]
-                o.transmit = True
-                self.ib.placeOrder(tr.contract, o)
-            # AUDIT FIND 2026-09-01: the DUOL stop modify (156.54 -> 156.51) never took
-            # effect at IBKR while the quantity did. Read the echo back (scheduled, never
-            # blocking inside the callback) and say so.
-            self._defer(1, lambda: self._check_modify(pend))
-        except Exception as ex:
-            self._say(f"  ⚠️ modify failed for {pend['ref']}: {ex}")
-
-    def _check_modify(self, pend):
-        sl = (pend.get("trades") or {}).get("SL")
-        if sl is not None and abs(float(sl.order.auxPrice or 0) - pend["stop"]) > 0.005:
-            self._say(f"  🚨 stop modify NOT applied at IBKR: server holds ${sl.order.auxPrice} "
-                      f"(wanted ${pend['stop']:.2f}) — risk differs from the ledger")
 
     # ---- pending-setup lifecycle -------------------------------------------
     def arm_pending(self, sym, tf, ri, st, B):
@@ -559,7 +633,16 @@ class Trader:
         self._say(f"  🔧 {B.ts[-1]:%m-%d %H:%M}  {sym} {pend['tf']} handle deepened -> stop ${new_stop:.2f}, "
                   f"{qty} sh, tp ${pend['target']:.2f}")
         if pend["trades"]:
-            self.modify_bracket(pend)
+            # 2026-09-02: IBKR error 10326 "OCA group revision is not allowed" — a bracket's
+            # children can NOT be modified in place (this is why the DUOL stop never moved on
+            # 09-01). The bracket is still unfilled here, so cancel it whole and re-place it.
+            try:
+                self.ib.cancelOrder(pend["trades"]["ENTRY"].order)   # children die with the parent
+            except Exception as ex:
+                self._say(f"  ⚠️ cancel before re-place failed for {pend['ref']}: {ex}")
+                return
+            pend["trades"] = self.place_bracket(sym, pend)
+            self._say(f"  🔁 bracket re-placed at the new levels (OCA cannot be revised)")
 
     def cancel_pending(self, sym, reason, ts=None):
         pend = self.pending.pop(sym)
@@ -576,7 +659,7 @@ class Trader:
         pend = self.pending.get(sym)
         if pend and pend["tf"] != tf:
             return                                     # slot held by another timeframe — cross-tf dedup
-        scan = scan_setups(self.det, B)
+        scan = scan_setups(self.det, B, self._memo.setdefault((sym, tf), {}))
         n = len(B)
         if pend:
             st = scan.get(pend["ri"])
@@ -642,11 +725,21 @@ class Trader:
         # rejected by IBKR, silently, and the position survives overnight with its
         # protective stop already cancelled above. Always route the close via SMART,
         # and never trust a flatten that IBKR has not confirmed.
+        import time as _time
+        if self._last_flatten and _time.time() - self._last_flatten < 15:
+            self._say(f"  ↩️ flatten ({reason}) skipped — one is already in flight (closes fill in ms; "
+                      f"ib.positions() lags, and re-placing sells oversold us into a SHORT on 2026-09-02)")
+            return
+        self._last_flatten = _time.time()
         closes = []
         for p in self.ib.positions():
             if p.position == 0:
                 continue
             sym = p.contract.symbol
+            inflight = self._inflight.get(sym)
+            if inflight is not None and inflight.orderStatus.status not in ("Filled", "Cancelled", "Inactive", "ApiCancelled"):
+                self._say(f"  ↩️ {sym}: a close is already working ({inflight.orderStatus.status}) — not placing another")
+                continue
             c = self.contracts.get(sym)
             if c is None:                              # another robot's position: still close it, routed
                 from ib_async import Stock
@@ -657,6 +750,7 @@ class Trader:
                     pass
             act = "SELL" if p.position > 0 else "BUY"
             tr = self.ib.placeOrder(c, self.MarketOrder(act, abs(p.position)))
+            self._inflight[sym] = tr
             closes.append((sym, p.position, tr))
         n = len(closes)
         self._say(f"  ⛔ FLATTEN ({reason}) — cancelled all orders (incl. pendings), closing {n} position(s)")
@@ -706,6 +800,7 @@ class Trader:
             B = Bars(symbol=sym, date=t.date(), timeframe=tf, ts=[], o=[], h=[], l=[], c=[], v=[])
             self.store[key] = B
             self.fired[key] = set()
+            self._memo[key] = {}                       # a new day: nothing is final yet
         if B.ts and t <= B.ts[-1]:
             return False                               # already ingested (reconnect replays)
         B.ts.append(t); B.o.append(o); B.h.append(h); B.l.append(l); B.c.append(c); B.v.append(v)
@@ -753,8 +848,8 @@ class Trader:
             self.paper = keep
         if t.time() >= EOD:                            # end of day
             if self._report and not self.eod_done:     # global flatten fires ONCE (orders, positions)
+                self.eod_done = True                   # set FIRST: an exception inside flatten must never re-arm it
                 self.flatten("EOD 15:49")
-                self.eod_done = True
             elif self._report and not self.a.arm:
                 # replay walks symbols sequentially: later symbols reach their own 15:49 AFTER the
                 # global flatten already fired -> close THIS symbol's shadow day properly.
@@ -779,16 +874,28 @@ class Trader:
             return True
         if self._report:
             self.reconcile(sym, tf, B)
-        # the FROZEN detector stays the referee: its entry events cross-check the pre-armer
+            # the FROZEN detector stays the referee: its entry events cross-check the pre-armer.
+            # SPEED (2026-09-02): only while live (a full detect() per bar was 60% of the replay
+            # and 100% of a slow seed — during seeding and replay it runs ONCE per symbol-day,
+            # see referee_once()).
+            if not self.a.replay:
+                self.referee_once(sym, tf, t)
+        return True
+
+    def referee_once(self, sym, tf, t=None):
+        """Cross-check every detector entry against what the pre-armer actually did."""
+        key = (sym, tf)
+        B = self.store.get(key)
+        if not B or not len(B):
+            return
         for e in self.det.detect(B, sym, B.date, signals_only=True):
             if e.breakout_idx in self.fired[key]:
                 continue
             self.fired[key].add(e.breakout_idx)
-            if self._report:
-                tag = ("pre-armed ✓" if self.entered_at.get(key) == e.breakout_idx
-                       else "NOT pre-armed (occupied / cap / seeded mid-handle)")
-                self._say(f"  📋 {t:%m-%d %H:%M}  detector confirms entry {sym} {tf} ${e.entry_price:.2f} — {tag}")
-        return True
+            tag = ("pre-armed ✓" if self.entered_at.get(key) == e.breakout_idx
+                   else "NOT pre-armed (occupied / cap / seeded mid-handle)")
+            self._say(f"  📋 {B.ts[e.breakout_idx]:%m-%d %H:%M}  detector confirms entry {sym} {tf} "
+                      f"${e.entry_price:.2f} — {tag}")
 
     def feed_1min(self, sym, t, o, h, l, c, v):
         """ONE closed BASE bar (15s in the program / 1min legacy) from ANY source ->
@@ -844,6 +951,9 @@ def main():
                     help="fetch bars by re-requesting history on a timer instead of streaming — "
                          "a fallback for REAL-TIME subscriptions (useless on delayed: IBKR's delayed "
                          "historical serves completed sessions only)")
+    ap.add_argument("--day", default=None,
+                    help="replay only: the session date (YYYY-MM-DD). When the day's 15s bars are "
+                         "already in cache/ibkr15s they are read from disk — no IBKR pull.")
     ap.add_argument("--replay", action="store_true",
                     help="walk the most recent COMPLETED session through the full live pipeline with "
                          "all lifecycle prints (run after ~16:20 ET to rehearse today), then exit")
@@ -950,8 +1060,12 @@ def main():
         # 5 D lookback, NOT 1 D: the window must ALWAYS contain >=1 trading session (holiday
         # weekends!). NOTE: on the free DELAYED tier this returns COMPLETED sessions only —
         # today's bars are invisible until the close; tick-mode below covers today.
-        bl = ib.reqHistoricalData(c, endDateTime="", durationStr=seed_dur, barSizeSetting=bar_size,
-                                  whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=stream)
+        cached = cached_day_bars(s, a.day) if (a.replay and a.day and base_tf == "15s") else None
+        if cached is not None:
+            bl = cached                                # replay from disk: seconds, not minutes
+        else:
+            bl = ib.reqHistoricalData(c, endDateTime="", durationStr=seed_dur, barSizeSetting=bar_size,
+                                      whatToShow="TRADES", useRTH=True, formatDate=2, keepUpToDate=stream)
         feed = bl
         if a.replay and len(bl):                       # replay ONLY the most recent session in the window
             def _d(x):
@@ -960,12 +1074,15 @@ def main():
             feed = [x for x in bl if _d(x) == last_day]
         was_live = bot._report
         bot.ingest(s, feed, report=a.replay)           # replay: walk that session with full lifecycle prints
-        bot._report = was_live or a.replay             # a mid-session seed must not silence the live board
+        bot._report = was_live or a.replay
+        if a.replay:
+            for tf_ in tfs:
+                bot.referee_once(s, tf_)               # once per symbol-day instead of once per bar             # a mid-session seed must not silence the live board
         seeded = " ".join(f"{len(bot.store.get((s, t), []))} {t}" for t in tfs)
-        if stream:
+        if stream and cached is None:
             bl.updateEvent += on_update
             seeds.append((s, bl))
-        say(f"  {s}: seeded {seeded} bars")
+        say(f"  {s}: seeded {seeded} bars" + (" (from cache)" if cached is not None else ""))
         return True
 
     for s in syms:
