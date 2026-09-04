@@ -40,6 +40,11 @@ from zoneinfo import ZoneInfo
 
 from data_layer import Bars
 from pattern_detector_tightflag import CONFIG, scan_day
+
+# USER 2026-09-03 universe policy: the index ETFs SPY and QQQ ARE tradable for this
+# strategy; every OTHER ETF/ETN/fund stays excluded. The cup screen rejects all
+# non-common stock, so those two (and only those two) get waved through here.
+ETF_ALLOWED = {"SPY", "QQQ"}
 from record_day import parse_sources                 # cup file — import only, never edited
 
 ET = ZoneInfo("America/New_York")
@@ -206,6 +211,9 @@ def record(day_s: str, ib=None, Stock=None) -> list[dict]:
         v = verdicts.get(sym)
         if v is not None:                              # the cup channel's verdict rules
             q, reason, logged = v["qualified"] == "yes", v.get("reason", ""), ""
+            if not q and sym in ETF_ALLOWED and "not common stock" in reason:
+                q, reason = True, ""
+                logged = "  (HTF policy: SPY/QQQ allowed despite the cup ETF screen)"
         else:                                          # same rules, computed locally
             logged = "  (unlogged — verdict computed locally, NOT written to the log)"
             if b is None:

@@ -895,6 +895,27 @@ def main():
         print(f"  ⚠️ skipping unrecognised ticker(s): {', '.join(unknown)}  "
               f"(delisted, renamed, or not available on this account)")
         syms = [s for s in syms if s in bot.contracts]
+
+    # USER 2026-09-03 universe policy: SPY and QQQ are the only tradable ETFs — every
+    # other ETF/ETN/fund is dropped here, mirroring the cup screen's stockType rule so
+    # the live session and the official record agree on the population.
+    ETF_ALLOWED = {"SPY", "QQQ"}
+    not_common = []
+    for s2 in list(bot.contracts):
+        if s2 in ETF_ALLOWED:
+            continue
+        try:
+            cds = ib.reqContractDetails(bot.contracts[s2])
+            st2 = (getattr(cds[0], "stockType", "") or "").upper() if cds else ""
+        except Exception:
+            st2 = ""
+        if st2 and st2 not in ("COMMON", "ADR"):
+            not_common.append((s2, st2))
+            del bot.contracts[s2]
+    if not_common:
+        print("  🚫 not common stock (only SPY/QQQ may be ETFs): "
+              + ", ".join(f"{a_}({b_})" for a_, b_ in not_common))
+        syms = [s for s in syms if s in bot.contracts]
     if not syms:
         sys.exit("✗ none of the requested tickers could be resolved — nothing to do.")
 
