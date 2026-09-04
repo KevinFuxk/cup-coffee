@@ -135,17 +135,23 @@ def cached_day_bars(sym: str, day: str):
 MIN_PRICE = 15.0
 # THE OLD UNIVERSE RULES, applied live to every ticker the watchlist hands us (user 2026-09-02).
 # IBKR contract details carry the classification (industry / category / stockType).
+ETF_ALLOWED = {"SPY", "QQQ"}          # USER 2026-09-03/04: the ONLY tradable ETFs. Every other
+                                      # ETF/ETN/fund is still dropped. The tight-flag program got
+                                      # this rule in 632682f; the cup program (live AND replay) was
+                                      # left rejecting SPY/QQQ as "not common stock" until now.
 COMMODITY_INDUSTRIES = {"Basic Materials"}                       # mining, steel, chemicals, forest
 COMMODITY_CATEGORIES = {"Oil&Gas", "Oil&Gas Services", "Coal", "Pipelines", "Mining", "Iron/Steel",
                         "Chemicals", "Forest Products&Paper", "Agriculture", "Metal Fabricate/Hardware"}
 
 
-def universe_verdict(price: float | None, details) -> str:
+def universe_verdict(sym: str, price: float | None, details) -> str:
     """'' if tradable, else the reason it is dropped. Rules: common stock only (no ETF/ETN/
-    fund), price >= $15, not commodity-related (oil/gas, coal, mining, metals, steel,
-    chemicals, agriculture). Every drop is recorded, never silent."""
+    fund) EXCEPT the whitelisted index ETFs SPY and QQQ; price >= $15; not commodity-related
+    (oil/gas, coal, mining, metals, steel, chemicals, agriculture). The whitelist waives ONLY
+    the stockType rule — a whitelisted name still has to clear price and commodity. Every drop
+    is recorded, never silent."""
     st = (getattr(details, "stockType", "") or "").upper()
-    if st and st not in ("COMMON", "ADR"):
+    if st and st not in ("COMMON", "ADR") and sym not in ETF_ALLOWED:
         return f"not common stock ({st})"
     if price is not None and price < MIN_PRICE:
         return f"price ${price:.2f} < ${MIN_PRICE:.0f} floor"
@@ -1349,7 +1355,7 @@ def main():
     def universe_hook(sym: str, open_px: float) -> None:
         """Pre-open start: the seed had no bar of today, so the $15 rule could not run. It
         runs HERE, on today's first bar — before any cup can possibly form (>= 19 bars)."""
-        why = universe_verdict(open_px, DETAILS.get(sym))
+        why = universe_verdict(sym, open_px, DETAILS.get(sym))
         row = note_universe(sym, open_px, why)
         record_universe(row["day"], [row])
         if why:
@@ -1414,7 +1420,7 @@ def main():
             DETAILS[s] = cds[0] if cds else None
         except Exception:
             DETAILS[s] = None
-        why = universe_verdict(price, DETAILS[s])
+        why = universe_verdict(s, price, DETAILS[s])
         if not a.replay:                               # replay screens but records nothing (history is
             note_universe(s, price, why)               # record_day.py's; today's rows are the live bot's)
         if why:

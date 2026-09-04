@@ -360,13 +360,20 @@ def test_universe_rules_as_code():
     """The old screening rules, live: >= $15, common stock only, no commodity names."""
     from types import SimpleNamespace as NS
     from live_trader_ibkr import universe_verdict
-    assert universe_verdict(36.7, NS(stockType="COMMON", industry="Technology", category="Semiconductors")) == ""
-    assert "floor" in universe_verdict(13.53, NS(stockType="COMMON", industry="Consumer, Non-cyclical", category="Pharmaceuticals"))
-    assert "not common" in universe_verdict(100.0, NS(stockType="ETF", industry="", category=""))
-    assert "commodity" in universe_verdict(160.0, NS(stockType="COMMON", industry="Energy", category="Oil&Gas"))
-    assert "commodity" in universe_verdict(128.0, NS(stockType="COMMON", industry="Basic Materials", category="Chemicals"))
-    assert universe_verdict(15.06, NS(stockType="COMMON", industry="Energy", category="Energy-Alternate Sources")) == ""
-    assert universe_verdict(None, None) == ""            # unknown price/details: never a false drop
+    assert universe_verdict("NVDA", 36.7, NS(stockType="COMMON", industry="Technology", category="Semiconductors")) == ""
+    assert "floor" in universe_verdict("SLS", 13.53, NS(stockType="COMMON", industry="Consumer, Non-cyclical", category="Pharmaceuticals"))
+    assert "not common" in universe_verdict("SOXL", 100.0, NS(stockType="ETF", industry="", category=""))
+    assert "commodity" in universe_verdict("XOM", 160.0, NS(stockType="COMMON", industry="Energy", category="Oil&Gas"))
+    assert "commodity" in universe_verdict("DOW", 128.0, NS(stockType="COMMON", industry="Basic Materials", category="Chemicals"))
+    assert universe_verdict("BE", 15.06, NS(stockType="COMMON", industry="Energy", category="Energy-Alternate Sources")) == ""
+    assert universe_verdict("NVDA", None, None) == ""    # unknown price/details: never a false drop
+    # USER 2026-09-03/04: SPY and QQQ are the ONLY tradable ETFs — live and replay both.
+    etf = NS(stockType="ETF", industry="", category="")
+    assert universe_verdict("SPY", 767.86, etf) == "", "SPY is whitelisted"
+    assert universe_verdict("QQQ", 710.85, etf) == "", "QQQ is whitelisted"
+    assert "not common" in universe_verdict("NUGT", 188.0, etf), "every other ETF still drops"
+    # the whitelist waives ONLY the ETF rule: a whitelisted name still faces price + commodity
+    assert "floor" in universe_verdict("SPY", 9.99, etf)
 
 
 class _Ev:
