@@ -295,6 +295,75 @@ def t_no_arming_after_eod():
         "an open position must be booked EOD at the 15:49 bar and stay closed"
 
 
+def t_eod_exit_bar():
+    """PIVOT BUG FIX 2026-09-04: on the 1-min clock the EOD flat must book off the
+    15:49 bar's close (the last window STARTING <= 15:49, same as the frozen
+    labeler) — not the old 5-min era's 15:45 bar (SMMT 09-03: 17.17 vs 17.21)."""
+    import live_trader_tightflag as L
+    assert (L.EOD_BAR_START.hour, L.EOD_BAR_START.minute) == (15, 49), \
+        f"EOD exit bar must derive to 15:49 on 1-min bars, got {L.EOD_BAR_START}"
+
+    class A:
+        symbols = []; watchlist = "auto"; arm = False; risk = 0.0025; base = 100000.0
+        max_positions = 2; max_notional = 1.0; delayed = False; replay = False
+
+    class NoIB:
+        def positions(self): return []
+        def accountValues(self): return []
+
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)    # 09:32 touches 10.40 -> fill
+    pad_to(b, 15 * 60 + 44, 10.50, 10.55, 10.45, 10.50)   # drifts; never near the 10.20 stop
+    pad_to(b, 15 * 60 + 45, 10.50, 11.15, 10.48, 11.11)   # the OLD (5-min era) exit bar
+    pad_to(b, 15 * 60 + 48, 10.50, 10.55, 10.48, 10.50)
+    pad_to(b, 15 * 60 + 49, 10.50, 12.40, 10.48, 12.34)   # the frozen labeler's exit bar
+    pad_to(b, 15 * 60 + 55, 10.50, 10.55, 10.48, 10.50)
+    bot = L.TightFlagTrader(NoIB(), None, None, A())
+    bot.say = lambda line: None        # NEVER write test narration into logs/ (8ace1bc)
+    bot.prev_close["TST"] = 9.0
+    for i in range(len(b)):
+        kk = (b.ts[i].hour * 60 + b.ts[i].minute - 570) // L.Clock5.WIDTH
+        bot.on_5min("TST", kk, b.ts[i], b.o[i], b.h[i], b.l[i], b.c[i], b.v[i], 1)
+    assert len(bot.closed) == 1, f"expected exactly one trade, got {len(bot.closed)}"
+    tr = bot.closed[0]
+    assert tr["kind"] == "EOD" and abs(tr["exit"] - 12.34) < 1e-9 and tr["ts"].minute == 49, \
+        f"EOD must book the 15:49 close (12.34), got {tr['kind']} @ {tr['exit']} ts {tr['ts']}"
+
+
+def t_no_reentry_after_stopout():
+    """BUG FIX 2026-09-04: a booked trade ends the symbol's day. After a same-window
+    stop-out, a re-touch of the entry level before 09:45 must NOT open a second
+    trade, and the window's end must not print a bogus no_trigger (TGTX 09-03)."""
+    import live_trader_tightflag as L
+
+    class A:
+        symbols = []; watchlist = "auto"; arm = False; risk = 0.0025; base = 100000.0
+        max_positions = 2; max_notional = 1.0; delayed = False; replay = False
+
+    class NoIB:
+        def positions(self): return []
+        def accountValues(self): return []
+
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.15, 10.22)    # fills 10.40 AND hits the 10.20 stop
+    pad_to(b, 9 * 60 + 35, 10.30, 10.45, 10.28, 10.42)    # re-touches the level before 09:45
+    pad_to(b, 9 * 60 + 50, 10.30, 10.35, 10.28, 10.32)    # past the entry window's end
+    said = []
+    bot = L.TightFlagTrader(NoIB(), None, None, A())
+    bot.say = said.append              # capture narration in memory, never in logs/
+    bot.prev_close["TST"] = 9.0
+    for i in range(len(b)):
+        kk = (b.ts[i].hour * 60 + b.ts[i].minute - 570) // L.Clock5.WIDTH
+        bot.on_5min("TST", kk, b.ts[i], b.o[i], b.h[i], b.l[i], b.c[i], b.v[i], 1)
+    assert len(bot.closed) == 1, f"re-touch must NOT re-enter (got {len(bot.closed)} trades)"
+    tr = bot.closed[0]
+    assert tr["kind"] == "STOP" and abs(tr["exit"] - 10.20) < 1e-9, \
+        "same-bar stop-out must price AT the stop"
+    assert "TST" not in bot.state and bot.done.get("TST"), "booked symbol must leave state"
+    assert not any("no_trigger" in x for x in said), \
+        "no bogus no_trigger for a symbol that DID trade"
+
+
 import os
 if __name__ == "__main__":
     print("tight-flag rule tests (1-min pivot rules)\n" + "=" * 46)
@@ -308,6 +377,8 @@ if __name__ == "__main__":
     check("prev-close long gate", t_prev_close_long_gate)
     check("no arming/entry after 15:49 (live path)", t_no_arming_after_eod)
     check("real-day golden (2026-08-28 recompute == ledger)", t_real_day_golden)
+    check("EOD books the 15:49 bar (1-min pivot fix)", t_eod_exit_bar)
+    check("no re-entry after a booked trade", t_no_reentry_after_stopout)
     print("=" * 46)
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
     raise SystemExit(1 if FAIL else 0)

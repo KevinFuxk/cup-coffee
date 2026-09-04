@@ -86,11 +86,15 @@ FILLS_CSV = "data/paper_fills_tightflag.csv"
 LEDGER_CSV = "data/live_trades_tightflag.csv"
 REF_PREFIX = "TF"                      # every order this bot creates carries it
 EOD = dtime(15, 49)
-# The frozen labeler exits at the close of the LAST 5-min window that STARTS at or
-# before 15:49 — i.e. the 15:45-15:50 bar. Booking on the next bar instead (15:50)
-# prices the flat off post-15:50 trade and silently disagrees with the backtest;
-# the bulk fidelity replay caught exactly that on 10 of 129 QQQ sessions.
-EOD_BAR_START = dtime(15, 45)
+# The frozen labeler exits at the close of the LAST clock window that STARTS at or
+# before 15:49 — which window that is depends on the configured bar width (15:45 on
+# the old 5-min clock, 15:49 on 1-min bars), so it is DERIVED from CONFIG here.
+# PIVOT BUG FIX 2026-09-04: this sat hardcoded at 15:45 after the 1-min switch, so
+# live flattened four minutes before the backtest (SMMT 09-03: booked $17.17 off the
+# 15:45 bar where the labeler books $17.21 off the 15:49 bar).
+_EODM = 9 * 60 + 30 + ((EOD.hour * 60 + EOD.minute) - (9 * 60 + 30)) \
+    // cfg_width(CONFIG) * cfg_width(CONFIG)
+EOD_BAR_START = dtime(_EODM // 60, _EODM % 60)
 ENTRY_T = dtime(9, 40)
 DEFAULT_SYMS = ["QQQ"]                 # user's preferred test symbol (2026-07-27)
 
@@ -491,7 +495,7 @@ class TightFlagTrader:
                          f"(low/high of the {prev['ts']:%H:%M} bar)")
                 if self.a.arm:
                     self.move_stop(sym, new)
-        if ts.time() >= EOD_BAR_START:                 # the 15:45 bar just closed -> flat
+        if ts.time() >= EOD_BAR_START:                 # the EOD exit bar just closed -> flat
             self._book(sym, st, c, "EOD", ts)
 
     def _evaluate(self, sym):
@@ -556,6 +560,7 @@ class TightFlagTrader:
         if qty <= 0:
             self.done[sym] = True
             st["open"] = False
+            self.state.pop(sym, None)         # dead for the day — never re-resolve entry
             self.say(f"  · {sym} STOOD DOWN — size resolved to 0 shares (equity/cap); no trade")
             return
         if self.a.arm and qty > 0:
@@ -591,6 +596,13 @@ class TightFlagTrader:
                 else:
                     self.cancel_my_stop(sym)
         st["open"] = False
+        # BUG FIX 2026-09-04: one setup, one trade. Leaving the symbol in self.state
+        # after booking kept the entry-resolution branch armed — a re-touch of the
+        # level before 09:45 after a same-window stop-out would have opened a SECOND
+        # trade, and the window's end printed a bogus "no_trigger" for a symbol that
+        # DID trade (TGTX 09-03).
+        self.done[sym] = True
+        self.state.pop(sym, None)
         self.done[sym] = True
 
     # ---- EOD -------------------------------------------------------------
@@ -754,11 +766,13 @@ def cache_replay(a, syms):
         TightFlagTrader.RUN_MODE = "cache"     # offline regression, not a real run
         bot = TightFlagTrader(_NoIB(), None, None, a)
         bot.day = datetime.fromisoformat(a.cache_day).date()
-        # previous session's close for the long gate — the prior cached day
-        days = sorted(f[:-5] for f in os.listdir(f"cache/ibkr5/{sym}") if f.endswith(".json"))
+        # previous session's close for the long gate — the prior cached day, from
+        # the SAME dataset the bars came from (stale cache/ibkr5 path fixed 2026-09-04)
+        cdir = os.path.dirname(p)
+        days = sorted(f[:-5] for f in os.listdir(cdir) if f.endswith(".json"))
         i = days.index(a.cache_day)
         if i > 0:
-            prev = _json.load(open(f"cache/ibkr5/{sym}/{days[i-1]}.json"))
+            prev = _json.load(open(f"{cdir}/{days[i-1]}.json"))
             if prev:
                 bot.prev_close[sym] = sorted(prev, key=lambda r: r["t"])[-1]["c"]
         print(f"\n  CACHE REPLAY {sym} {a.cache_day}   prev close "
