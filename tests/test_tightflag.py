@@ -364,6 +364,285 @@ def t_no_reentry_after_stopout():
         "no bogus no_trigger for a symbol that DID trade"
 
 
+# ---- ARMED TRUTH harness (2026-09-09): a fake broker so the armed decision path
+# ---- can be tested without IBKR. The invariant under test: bars decide INTENT
+# ---- (place, cancel, flatten); only broker fills create or close a position.
+from types import SimpleNamespace as _NS
+
+
+def _armed_rig():
+    import live_trader_tightflag as L
+
+    class FEvent(list):
+        def __iadd__(self, fn):
+            self.append(fn); return self
+        def emit(self, *a):
+            for fn in list(self):
+                fn(*a)
+
+    class FTrade:
+        def __init__(self, order, contract):
+            self.order, self.contract = order, contract
+            self.orderStatus = _NS(status="Submitted", avgFillPrice=0.0,
+                                   filled=0, remaining=0)
+            self.fillEvent = FEvent()
+
+    class FIB:
+        def __init__(self):
+            self.client = _NS(getReqId=lambda: 1)
+            self.trades, self.cancelled, self.pos = [], [], {}
+        def placeOrder(self, c, o):
+            t = FTrade(o, c); self.trades.append(t); return t
+        def cancelOrder(self, o):
+            self.cancelled.append(o)
+        def positions(self):
+            return [_NS(contract=_NS(symbol=k), position=v) for k, v in self.pos.items()]
+        def accountValues(self):
+            return []
+        def sleep(self, n):
+            pass
+
+    class FOrder:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class FMkt:
+        def __init__(self, action, totalQuantity):
+            self.action, self.totalQuantity = action, totalQuantity
+            self.orderType = "MKT"
+
+    class A:
+        symbols = []; watchlist = "auto"; arm = True; risk = 0.0025; base = 100000.0
+        max_positions = 2; max_notional = 1.0; delayed = False; replay = False
+
+    fib = FIB()
+    bot = L.TightFlagTrader(fib, FOrder, FMkt, A())
+    said = []
+    bot.say = said.append                  # NEVER write test narration into logs/
+    bot._fill_logger = lambda kind, sym: (lambda *a: None)   # never write paper_fills
+    # _book now persists on every armed booking, so the REAL ledger is one call away
+    # from a fake TST row (it happened once — 2026-09-10). Count the calls instead.
+    bot.ledger_writes = []
+    bot.write_ledger = lambda: bot.ledger_writes.append(len(bot.closed))
+    bot._now = lambda: datetime(DAY.year, DAY.month, DAY.day, 9, 33)
+    bot.prev_close["TST"] = 9.0
+    bot.contracts["TST"] = object()
+
+    def drive(bars, start=0):
+        for i in range(start, len(bars.ts)):
+            kk = (bars.ts[i].hour * 60 + bars.ts[i].minute - 570) // L.Clock5.WIDTH
+            bot.on_5min("TST", kk, bars.ts[i], bars.o[i], bars.h[i],
+                        bars.l[i], bars.c[i], bars.v[i], 1)
+    return L, fib, bot, said, drive
+
+
+def _fill(price, shares, hh, mm):
+    """A realistic ib_async Fill: the EXECUTION carries cumQty/avgPrice (cumulative
+    for the order, correct at emit time). AUDIT 2026-09-10 — the old rig omitted
+    these and hand-set trade.orderStatus before emitting, which is exactly what the
+    real library does NOT do; that made the suite blind to three critical bugs."""
+    return _NS(execution=_NS(price=price, shares=shares, cumQty=shares, avgPrice=price),
+               time=datetime(DAY.year, DAY.month, DAY.day, hh, mm))
+
+
+def _stale(trade):
+    """Put trade.orderStatus in the state the real library leaves it in when
+    fillEvent fires: the submission status, with NOTHING filled yet."""
+    trade.orderStatus = _NS(status="Submitted", avgFillPrice=0.0, filled=0,
+                            remaining=float(trade.order.totalQuantity))
+    return trade
+
+
+def t_armed_books_from_a_stale_orderstatus():
+    """CRITICAL AUDIT FIX 2026-09-10: ib_async emits fillEvent from execDetails and
+    does NOT update trade.orderStatus there. Entry AND exit must book from the
+    EXECUTION alone — with orderStatus still saying 'nothing filled'."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)
+    drive(b)
+    entry = _stale(fib.trades[0])
+    entry.fillEvent.emit(entry, _fill(10.47, entry.order.totalQuantity, 9, 32))
+    st = bot.state.get("TST")
+    assert st and st.get("open"), "a stale orderStatus must not stop the entry booking"
+    assert abs(st["entry"] - 10.47) < 1e-9 and st["qty"] == entry.order.totalQuantity
+    stop_tr = _stale(fib.trades[1])
+    assert stop_tr.order.totalQuantity == st["qty"], "the stop must cover the position"
+    stop_tr.fillEvent.emit(stop_tr, _fill(10.18, stop_tr.order.totalQuantity, 9, 34))
+    assert len(bot.closed) == 1 and bot.closed[0]["kind"] == "STOP", \
+        "a completed stop-out MUST book even though orderStatus.remaining is stale"
+    assert abs(bot.closed[0]["exit"] - 10.18) < 1e-9
+    assert bot.ledger_writes, "an armed booking must persist immediately, not at 15:49"
+
+
+def t_armed_partial_entry_protects_the_whole_position():
+    """CRITICAL AUDIT FIX 2026-09-10: a two-tranche entry must leave the protective
+    stop covering the CUMULATIVE position, never one tranche."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)
+    drive(b)
+    entry = _stale(fib.trades[0])
+    total = int(entry.order.totalQuantity)
+    first = total // 3
+    entry.fillEvent.emit(entry, _NS(
+        execution=_NS(price=10.40, shares=first, cumQty=first, avgPrice=10.40),
+        time=datetime(DAY.year, DAY.month, DAY.day, 9, 32)))
+    stop_tr = fib.trades[1]
+    assert int(stop_tr.order.totalQuantity) == first, "tranche 1 protected"
+    rest = total - first
+    entry.fillEvent.emit(entry, _NS(
+        execution=_NS(price=10.50, shares=rest, cumQty=total, avgPrice=10.44),
+        time=datetime(DAY.year, DAY.month, DAY.day, 9, 33)))
+    assert bot.state["TST"]["qty"] == total, \
+        f"position must be the cumulative {total}, got {bot.state['TST']['qty']}"
+    assert int(stop_tr.order.totalQuantity) == total, \
+        "the protective stop must be resized to the WHOLE position, never one tranche"
+    assert abs(bot.state["TST"]["entry"] - 10.44) < 1e-9, "entry is the average fill"
+
+
+def t_armed_never_duplicates_an_in_flight_close():
+    """CRITICAL AUDIT FIX 2026-09-10: while a market close is unfilled the protective
+    stop is (correctly) cancelled — that must not make every later bar send another
+    full-size close (a halted symbol would end up short the position it flattened)."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)
+    drive(b)
+    entry = _stale(fib.trades[0])
+    entry.fillEvent.emit(entry, _fill(10.41, entry.order.totalQuantity, 9, 32))
+    qty = bot.state["TST"]["qty"]
+    fib.pos["TST"] = qty                                   # broker holds the shares
+    fib.trades[1].orderStatus = _NS(status="Cancelled", avgFillPrice=0.0,
+                                    filled=0, remaining=0)  # killed from outside
+    for m in range(33, 40):                                # seven more bars, no fill
+        pad_to(b, 9 * 60 + m, 10.45, 10.46, 10.44, 10.45)
+        drive(b, len(b.ts) - 1)
+    mkts = [t for t in fib.trades if getattr(t.order, "orderType", "") == "MKT"]
+    assert len(mkts) == 1, f"exactly ONE close may be in flight, got {len(mkts)}"
+    assert bot.state["TST"]["open"], "the trade stays open until the close FILLS"
+    assert not bot.closed, "no booking without a broker fill"
+
+
+def t_armed_missing_0944_bar_still_cancels_the_entry():
+    """MAJOR AUDIT FIX 2026-09-10: IBKR omits a 1-min bar when nothing trades in it.
+    If the missing one straddles the deadline, the old cleanup never ran and the DAY
+    entry order rested live all session (the 09-09 landmine). ANY later bar sweeps."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    for m in range(32, 51):
+        if m == 44:
+            continue                                       # 09:44 never printed
+        pad_to(b, 9 * 60 + m, 10.30, 10.35, 10.28, 10.32)  # never touches 10.40
+    drive(b)
+    entry = fib.trades[0]
+    assert entry.order in fib.cancelled, \
+        "a missing 09:44 bar must NOT strand a live entry order"
+    assert bot.done.get("TST") and "TST" not in bot.state
+
+
+def t_order_legs_are_distinguishable():
+    """MAJOR AUDIT FIX 2026-09-10: a restart sweep must be able to tell an unfilled
+    ENTRY (cancel it) from a PROTECTIVE stop guarding real shares (never cancel it).
+    A short's entry is a SELL STP exactly like a long's protective stop, so the only
+    safe discriminator is the leg tag on the orderRef."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)
+    drive(b)
+    entry = _stale(fib.trades[0])
+    assert entry.order.orderRef.endswith("-E"), entry.order.orderRef
+    entry.fillEvent.emit(entry, _fill(10.41, entry.order.totalQuantity, 9, 32))
+    assert fib.trades[1].order.orderRef.endswith("-P"), fib.trades[1].order.orderRef
+    fib.pos["TST"] = bot.state["TST"]["qty"]
+    bot.close_my_position("TST", bot.state["TST"], "EOD flatten")
+    mkt = [t for t in fib.trades if getattr(t.order, "orderType", "") == "MKT"][0]
+    assert mkt.order.orderRef.endswith("-C"), mkt.order.orderRef
+
+
+def t_armed_entry_and_exit_are_broker_fills():
+    """ARMED TRUTH: a bar touching the level opens nothing; a bar touching the stop
+    closes nothing. The broker's fills do both, at THEIR prices (TER 09-09)."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)    # bars touch the 10.40 level
+    pad_to(b, 9 * 60 + 33, 10.39, 10.39, 10.14, 10.16)    # bars pierce the 10.20 stop
+    drive(b)
+    st = bot.state.get("TST")
+    assert st is not None and not st.get("open"), "bar touch must NOT open an armed trade"
+    assert not bot.closed, "nothing may book before a broker fill"
+    entry = fib.trades[0]
+    assert entry.order.orderType == "STP" and entry.order.action == "BUY"
+
+    entry.orderStatus = _NS(status="Filled", avgFillPrice=10.47, filled=1250, remaining=0)
+    entry.fillEvent.emit(entry, _fill(10.47, 1250, 9, 32))     # the REAL fill, slipped
+    st = bot.state["TST"]
+    assert st["open"] and abs(st["entry"] - 10.47) < 1e-9, "entry must be the broker's price"
+    assert abs(st["R"] - 0.27) < 1e-9, "R must be |real entry - stop|, not the modeled 0.20"
+    stop_tr = fib.trades[1]
+    assert stop_tr.order.action == "SELL" and abs(stop_tr.order.auxPrice - 10.20) < 1e-9
+
+    pad_to(b, 9 * 60 + 34, 10.16, 10.18, 10.10, 10.12)    # another bar through the stop
+    drive(b, len(b.ts) - 1)
+    assert bot.state["TST"]["open"] and not bot.closed, \
+        "a bar at the stop price books nothing while armed"
+
+    stop_tr.orderStatus = _NS(status="Filled", avgFillPrice=10.18, filled=1250, remaining=0)
+    stop_tr.fillEvent.emit(stop_tr, _fill(10.18, 1250, 9, 34))
+    assert len(bot.closed) == 1 and bot.closed[0]["kind"] == "STOP"
+    assert abs(bot.closed[0]["exit"] - 10.18) < 1e-9, "exit must be the broker's fill price"
+    assert "TST" not in bot.state and bot.done.get("TST")
+
+
+def t_armed_late_start_places_nothing():
+    """LATE-ARM GUARD: a setup whose entry window is already over places NO order
+    and books NO row (the 12:07 TER catastrophe)."""
+    L, fib, bot, said, drive = _armed_rig()
+    bot._now = lambda: datetime(DAY.year, DAY.month, DAY.day, 12, 7)
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 40, 10.32, 10.45, 10.30, 10.42)    # bars even touch the level
+    drive(b)
+    assert not fib.trades, "a late start must never send an order"
+    assert bot.done.get("TST") and "TST" not in bot.state and not bot.closed
+    assert any("LATE START" in x for x in said)
+
+
+def t_armed_no_trigger_cancels_the_entry_order():
+    """BUG FIX 2026-09-09 (KLAC): when the level is never reached by 09:45, the
+    RESTING ENTRY itself must be cancelled — not the nonexistent stop leg."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 50, 10.30, 10.35, 10.28, 10.32)    # never touches 10.40
+    drive(b)
+    entry = fib.trades[0]
+    assert entry.order in fib.cancelled, "the unfilled resting entry MUST be cancelled"
+    assert bot.done.get("TST") and "TST" not in bot.state
+
+
+def t_armed_eod_closes_at_market_and_books_its_fill():
+    """ARMED EOD: the flatten is a real market order and the ledger gets ITS fill."""
+    L, fib, bot, said, drive = _armed_rig()
+    b = mk(B1, B2)
+    pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)
+    drive(b)
+    entry = fib.trades[0]
+    entry.orderStatus = _NS(status="Filled", avgFillPrice=10.41, filled=1250, remaining=0)
+    entry.fillEvent.emit(entry, _fill(10.41, 1250, 9, 32))
+    fib.pos["TST"] = 1250                                  # broker net = our long
+    pad_to(b, 15 * 60 + 49, 10.50, 10.95, 10.45, 10.90)   # quiet drift to the EOD bar
+    pad_to(b, 15 * 60 + 51, 10.90, 10.92, 10.85, 10.88)
+    drive(b, len(b.ts) - (15 * 60 + 51 - (9 * 60 + 32)))
+    closes = [t for t in fib.trades if getattr(t.order, "orderType", "") == "MKT"]
+    assert closes, "the EOD flatten must send a real market order"
+    assert bot.state["TST"].get("closing") and not bot.closed, \
+        "the exit books on the close FILL, not on the bar"
+    ct = closes[0]
+    ct.orderStatus = _NS(status="Filled", avgFillPrice=10.89, filled=1250, remaining=0)
+    ct.fillEvent.emit(ct, _fill(10.89, 1250, 15, 50))
+    assert len(bot.closed) == 1 and bot.closed[0]["kind"] == "EOD"
+    assert abs(bot.closed[0]["exit"] - 10.89) < 1e-9, "EOD must book the real close fill"
+
+
 import os
 if __name__ == "__main__":
     print("tight-flag rule tests (1-min pivot rules)\n" + "=" * 46)
@@ -379,6 +658,15 @@ if __name__ == "__main__":
     check("real-day golden (2026-08-28 recompute == ledger)", t_real_day_golden)
     check("EOD books the 15:49 bar (1-min pivot fix)", t_eod_exit_bar)
     check("no re-entry after a booked trade", t_no_reentry_after_stopout)
+    check("ARMED: entry/exit are broker fills, not bars", t_armed_entry_and_exit_are_broker_fills)
+    check("ARMED: late start places nothing", t_armed_late_start_places_nothing)
+    check("ARMED: no_trigger cancels the ENTRY order", t_armed_no_trigger_cancels_the_entry_order)
+    check("ARMED: EOD closes at market, books its fill", t_armed_eod_closes_at_market_and_books_its_fill)
+    check("ARMED: books from a STALE orderStatus", t_armed_books_from_a_stale_orderstatus)
+    check("ARMED: partial entry protects the whole position", t_armed_partial_entry_protects_the_whole_position)
+    check("ARMED: never duplicates an in-flight close", t_armed_never_duplicates_an_in_flight_close)
+    check("ARMED: missing 09:44 bar still cancels the entry", t_armed_missing_0944_bar_still_cancels_the_entry)
+    check("ARMED: order legs are distinguishable (E/P/C)", t_order_legs_are_distinguishable)
     print("=" * 46)
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
     raise SystemExit(1 if FAIL else 0)

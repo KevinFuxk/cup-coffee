@@ -65,7 +65,7 @@ USAGE
 from __future__ import annotations
 
 import os, sys, argparse, csv
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 from pattern_detector_tightflag import (CONFIG, cfg_width, detect, prev_close_gate, r_unit_for,
@@ -223,9 +223,22 @@ class TightFlagTrader:
             return False
         status = getattr(getattr(tr, "orderStatus", None), "status", "")
         if status in ("Cancelled", "ApiCancelled", "Inactive"):
+            # AUDIT FIX 2026-09-10: this used to book EXT at a BAR price on sight and
+            # walk away. But an orders-only "cancel all" (or a rejected stop that goes
+            # Inactive) kills the protection WITHOUT touching the shares — booking
+            # there records a fiction and abandons a live, naked position, the exact
+            # TER failure. Ask the broker first; only a flat account may be booked.
+            net = self.broker_qty(sym)
+            ours_long = st["side"] == "long"
+            if (net > 0) if ours_long else (net < 0):
+                self.say(f"  🚨 {sym} our STOP is {status} but the broker still shows "
+                         f"{net:+.0f} — the position is NAKED. Closing at market now; "
+                         f"the ledger will book that fill.")
+                self.close_my_position(sym, st, f"stop {status}")
+                return True
             self.say(f"  ⚠️ {sym} our STOP was cancelled by something outside this bot "
-                     f"(global cancel / kill-switch / manual). Position is unprotected — "
-                     f"booking at last price and standing down.")
+                     f"(global cancel / kill-switch / manual) and the broker shows "
+                     f"{net:+.0f} — the position is already gone. Booking and standing down.")
             self._book(sym, st, last_px, "EXT", ts)
             return True
         return False
@@ -254,7 +267,16 @@ class TightFlagTrader:
 
     # ---- orders (scoped: we only ever touch refs we created) -------------
     def _ref(self, sym) -> str:
+        """Our internal book key for a symbol-day (NOT what goes on the order)."""
         return f"{REF_PREFIX}-{sym}-{self.day:%Y%m%d}"
+
+    def _oref(self, sym, leg) -> str:
+        """The orderRef stamped on a REAL order. AUDIT FIX 2026-09-10: both legs
+        used to carry the identical ref, so a restart sweep could not tell an
+        unfilled ENTRY landmine (cancel it) from the PROTECTIVE stop guarding live
+        shares (never cancel it) — a short setup's entry is a SELL STP exactly like
+        a long's protective stop. leg: E=entry, P=protective, C=close."""
+        return f"{self._ref(sym)}-{leg}"
 
     def place_stop_entry(self, sym, side, level, stop):
         """Resting STOP-ENTRY at `level` (USER 2026-07-28). It is valid during bar 3
@@ -270,10 +292,14 @@ class TightFlagTrader:
             return None
         o = self.Order(orderId=self.ib.client.getReqId(), action=act, orderType="STP",
                        totalQuantity=qty, auxPrice=round(level, 2), tif="DAY",
-                       orderRef=ref, transmit=True)
+                       orderRef=self._oref(sym, "E"), transmit=True)
         tr = self.ib.placeOrder(c, o)
         tr.fillEvent += self._fill_logger("ENTRY", sym)
+        tr.fillEvent += (lambda trade, fill: self._on_entry_fill(sym, trade, fill))
         self.my_orders.setdefault(ref, {})["entry"] = tr
+        # enough context to manage the position even if the waiting state was
+        # cleaned up before a late fill event arrived (fills are asynchronous)
+        self.my_orders[ref]["ctx"] = dict(side=side, level=level, stop=stop)
         self.say(f"  📌 {sym} resting {act}-STOP {qty} @ ${level:.2f} placed")
         return tr
 
@@ -284,9 +310,10 @@ class TightFlagTrader:
         exit_act = "SELL" if side == "long" else "BUY"
         o = self.Order(orderId=self.ib.client.getReqId(), action=exit_act, orderType="STP",
                        totalQuantity=qty, auxPrice=round(stop, 2), tif="DAY",
-                       orderRef=ref, transmit=True)
+                       orderRef=self._oref(sym, "P"), transmit=True)
         tr = self.ib.placeOrder(c, o)
         tr.fillEvent += self._fill_logger("STOP", sym)
+        tr.fillEvent += (lambda trade, fill: self._on_exit_fill(sym, trade, fill, "STOP"))
         self.my_orders.setdefault(ref, {})["stop"] = tr
         return tr
 
@@ -309,6 +336,14 @@ class TightFlagTrader:
         the position at market rather than book a fiction and walk away."""
         if not self.a.arm or not st.get("open"):
             return True
+        if st.get("closing"):
+            # AUDIT FIX 2026-09-10: close_my_position cancels our protective stop
+            # BEFORE sending its market close, so from here the stop looks "missing"
+            # on every later bar until the close fills. Without this guard a queued
+            # close (LULD halt, thin book) got another FULL-SIZE market order every
+            # bar — three bars of a halt, three closes, and the account ends up short
+            # the position it was flattening. A close is in flight: leave it alone.
+            return True
         h = self.my_orders.get(self._ref(sym)) or {}
         tr = h.get("stop")
         stt = getattr(getattr(tr, "orderStatus", None), "status", "") if tr else "missing"
@@ -319,22 +354,176 @@ class TightFlagTrader:
             return False
         return True
 
+    @staticmethod
+    def _is_done(tr) -> bool:
+        """Trade in one of ib_async's DoneStates — modifying or cancelling it raises."""
+        return getattr(getattr(tr, "orderStatus", None), "status", "") in (
+            "Filled", "Cancelled", "ApiCancelled", "Inactive")
+
     def move_stop(self, sym, new_stop):
         ref = self._ref(sym)
         h = self.my_orders.get(ref)
         if not h:
             return
-        o = h["stop"].order
+        tr = h.get("stop")
+        if tr is None or self._is_done(tr):
+            return                                     # exited/dead — nothing to trail
+        o = tr.order
         o.auxPrice = round(new_stop, 2)
         self.ib.placeOrder(self.contracts[sym], o)     # same orderId = modify
 
     def cancel_my_stop(self, sym):
         h = self.my_orders.get(self._ref(sym))
-        if h and h.get("stop"):
+        tr = h.get("stop") if h else None
+        if tr is not None and not self._is_done(tr):
             try:
-                self.ib.cancelOrder(h["stop"].order)
+                self.ib.cancelOrder(tr.order)
             except Exception:
                 pass
+
+    def cancel_my_entry(self, sym):
+        """BUG FIX 2026-09-09: the no_trigger cleanup used to call cancel_my_stop —
+        the PROTECTIVE leg, which does not even exist before a fill — so the unfilled
+        resting ENTRY stayed working until the DAY expiry (KLAC 09-09: a live
+        228-share buy-stop nobody was watching). Cancel the leg that was meant."""
+        h = self.my_orders.get(self._ref(sym))
+        tr = h.get("entry") if h else None
+        if tr is not None and not self._is_done(tr):
+            try:
+                self.ib.cancelOrder(tr.order)
+            except Exception:
+                pass
+
+    def _resize_stop(self, sym, qty):
+        """A partial entry topped up — the protective stop must cover what we hold."""
+        h = self.my_orders.get(self._ref(sym)) or {}
+        tr = h.get("stop")
+        if tr is not None and not self._is_done(tr):
+            tr.order.totalQuantity = qty
+            self.ib.placeOrder(self.contracts[sym], tr.order)
+
+    def _now(self):
+        return datetime.now(ET).replace(tzinfo=None)
+
+    @staticmethod
+    def _fill_ts(fill):
+        t = getattr(fill, "time", None)
+        if t is None:
+            return None
+        return t.astimezone(ET).replace(tzinfo=None) if getattr(t, "tzinfo", None) else t
+
+    @staticmethod
+    def _exec_truth(trade, fill):
+        """(cumulative qty, average price) for THIS order, read from the EXECUTION.
+
+        AUDIT FIX 2026-09-10 — the single most dangerous bug in the armed redesign.
+        ib_async emits fillEvent from execDetails and does NOT update
+        trade.orderStatus there: filled / remaining / avgFillPrice are written by a
+        SEPARATE wire message whose ordering TWS does not guarantee. Reading them in
+        a fill handler is a coin flip — they can still hold the previous tranche, or
+        the 0/0 defaults. execution.cumQty and execution.avgPrice are cumulative for
+        the order and correct at emit time; trade.fills is appended before the emit,
+        so summing it is the belt-and-braces fallback (it is how ib_async's own
+        Trade.filled() is defined)."""
+        ex = fill.execution
+        qty = int(getattr(ex, "cumQty", 0) or 0)
+        if qty <= 0:
+            fills = list(getattr(trade, "fills", None) or [fill])
+            qty = int(sum(float(f.execution.shares) for f in fills))
+        px = float(getattr(ex, "avgPrice", 0) or 0) or float(ex.price)
+        return qty, px
+
+    @classmethod
+    def _exec_complete(cls, trade, fill):
+        """Is the ORDER now fully filled? Same reasoning as _exec_truth: compare the
+        execution's cumulative quantity against the order's own size, never
+        orderStatus.remaining (which reads 0 both before the first status message
+        AND after completion — indistinguishable, and it made every armed exit
+        wedge open for the rest of the day)."""
+        want = float(getattr(trade.order, "totalQuantity", 0) or 0)
+        got, _ = cls._exec_truth(trade, fill)
+        return want <= 0 or got + 1e-9 >= want
+
+    def _on_entry_fill(self, sym, trade, fill):
+        """ARMED TRUTH (2026-09-09): a position EXISTS when IBKR fills it, at IBKR's
+        price — never when a bar touches a level. TER 09-09: the bars booked a
+        fictional 378.00 entry and 375.01 exit while the account actually bought
+        81 @ 380.04 (+204c slip) and kept them, unprotected."""
+        if not self.a.arm:
+            return
+        ref = self._ref(sym)
+        ctx = (self.my_orders.get(ref) or {}).get("ctx") or {}
+        qty, px = self._exec_truth(trade, fill)
+        ts = self._fill_ts(fill) or self._now()
+        st = self.state.get(sym)
+        if st is None:
+            # the window-end cleanup (or a completed trade) raced this fill. AUDIT FIX
+            # 2026-09-10: cumQty counts EVERY share this order ever filled, including
+            # any we have already exited, so size the adoption from what the broker
+            # actually shows — and if it shows nothing, there is no position to adopt.
+            net = self.broker_qty(sym)
+            side = ctx.get("side", "long")
+            live = int(abs(net)) if ((net > 0) if side == "long" else (net < 0)) else 0
+            if live <= 0:
+                self.say(f"  ℹ️ {sym} a late entry fill arrived but the broker shows no "
+                         f"{side} position ({net:+.0f}) — nothing to adopt, standing down")
+                return
+            self.say(f"  🚨 {sym} broker filled AFTER the window cleanup — adopting the "
+                     f"{live} share(s) it actually shows and managing them "
+                     f"(real money beats tidy state)")
+            qty = min(qty, live)
+            st = self.state[sym] = dict(side=side, setup=None,
+                                        entry_level=ctx.get("level", 0.0),
+                                        fly=False, trail=0, mfe=0.0)
+            self.done.pop(sym, None)
+        first = not st.get("open")
+        stop = st.get("stop") if not first else ctx.get("stop")
+        if stop is None:
+            setup = st.get("setup") or {}
+            stop = setup.get("l2") if st["side"] == "long" else setup.get("h2")
+        st.update(open=True, entry=px, stop=stop, qty=qty, entry_ts=ts, fill_k=None,
+                  R=max(abs(px - stop), 1e-9), late=0)
+        st.setdefault("mfe", 0.0); st.setdefault("fly", False); st.setdefault("trail", 0)
+        if first:
+            self.say(f"  ▶ {sym} BROKER FILLED {st['side'].upper()} {qty} @ ${px:.2f} "
+                     f"(level ${st.get('entry_level', 0.0):.2f})  stop ${stop:.2f}  "
+                     f"R ${st['R']:.2f}  [🔴 ARMED]")
+            self.attach_protective_stop(sym, st["side"], qty, stop)
+        else:
+            self._resize_stop(sym, qty)
+
+    def _on_exit_fill(self, sym, trade, fill, kind):
+        """ARMED TRUTH: the exit is booked from the broker's fill — its price, its
+        time — never from a bar touching the stop level."""
+        st = self.state.get(sym)
+        if st is None or not st.get("open"):
+            return
+        if not self._exec_complete(trade, fill):
+            _q, _p = self._exec_truth(trade, fill)
+            self.say(f"  … {sym} {kind} partial: {_q:.0f} of "
+                     f"{float(trade.order.totalQuantity):.0f} filled — still exiting")
+            return                                     # partial — wait for the rest
+        _q, px = self._exec_truth(trade, fill)
+        self._book(sym, st, px, kind, self._fill_ts(fill) or self._now())
+
+    def shutdown_report(self):
+        """ARMED shutdown: cancel unfilled entry landmines, KEEP protective stops,
+        and shout about any real position left behind."""
+        for ref, h in self.my_orders.items():
+            tr = h.get("entry")
+            if tr is not None and getattr(getattr(tr, "orderStatus", None), "status", "") \
+                    not in ("Filled", "Cancelled", "ApiCancelled"):
+                try:
+                    self.ib.cancelOrder(tr.order)
+                    self.say(f"  🧹 cancelled the unfilled resting entry {ref}")
+                except Exception:
+                    pass
+        for sym, st in list(self.state.items()):
+            if st.get("open"):
+                self.say(f"  🚨 SHUTDOWN WITH AN OPEN POSITION: {sym} {st['side']} "
+                         f"{st.get('qty', '?')} @ ${st.get('entry', 0.0):.2f} — the "
+                         f"protective stop is left WORKING but it is a DAY order (dies "
+                         f"at the close). FLATTEN MANUALLY AT IBKR.")
 
     def close_my_position(self, sym, st, why):
         """Market-close THIS bot's own position.
@@ -353,10 +542,11 @@ class TightFlagTrader:
         """
         st["closing"] = True
         self.cancel_my_stop(sym)
+        self.cancel_my_entry(sym)
         want = int(st.get("qty") or 0)
         if not (self.a.arm and want > 0):
             self.say(f"  ⛔ {sym} closing own position ({why})")
-            return
+            return False
         net = self.broker_qty(sym)
         ours_long = st["side"] == "long"
         same_side = (net > 0) if ours_long else (net < 0)
@@ -364,14 +554,26 @@ class TightFlagTrader:
             self.say(f"  ⚠️ {sym} NOT sending a close ({why}) — broker shows {net:+.0f}, "
                      f"which is flat or opposite to our {'long' if ours_long else 'short'}. "
                      f"Something already closed us; sending an order would OPEN a reverse position.")
-            return
+            if st.get("open"):
+                # the position is gone at the broker — record reality, never a ghost
+                B = self.bars.get(sym, {})
+                px = B[self.order5[sym][-1]]["c"] if self.order5.get(sym) else st.get("entry", 0.0)
+                self._book(sym, st, px, "EXT", self._now())
+            return False
         qty = int(min(want, abs(net)))
         act = "SELL" if ours_long else "BUY"
         o = self.MarketOrder(act, qty)
-        o.orderRef = self._ref(sym)
-        self.ib.placeOrder(self.contracts[sym], o)
+        o.orderRef = self._oref(sym, "C")
+        kind = "EOD" if why.startswith("EOD") else "EXT"
+        tr = self.ib.placeOrder(self.contracts[sym], o)
+        try:
+            tr.fillEvent += self._fill_logger("EXIT", sym)
+            tr.fillEvent += (lambda trade, fill, k=kind: self._on_exit_fill(sym, trade, fill, k))
+        except Exception:
+            pass
         extra = "" if qty == want else f"  (clamped from {want}; broker net {net:+.0f})"
         self.say(f"  ⛔ {sym} closing OUR {qty} ({why}){extra}")
+        return True
 
     def _fill_logger(self, kind, sym):
         def on_fill(trade, fill):
@@ -428,9 +630,24 @@ class TightFlagTrader:
         if not st:
             return
 
-        # ---- resolve the resting STOP-ENTRY (bar 3 .. 09:45, USER 2026-09-02) ----
+        # ---- the entry window is over: retire an unfilled setup --------------
+        # AUDIT FIX 2026-09-10: the cleanup below only fires on the single bucket
+        # that STRADDLES the deadline (09:44). IBKR omits a 1-min bar whenever the
+        # symbol does not trade during it — routine on thin gappers — and when the
+        # missing one is 09:44 the cleanup never runs: the resting DAY order stays
+        # live and unattended for the rest of the session, free to fill hours late.
+        # That is the 09-09 landmine. Any bar at/after the deadline retires it.
         _w = Clock5.WIDTH
         _dead = self.cfg.get("entry_deadline_min", 15)
+        if not st.get("open") and k * _w >= _dead:
+            self.done[sym] = True
+            self.state.pop(sym, None)
+            self.cancel_my_entry(sym)
+            self.say(f"  · {sym} no trade — entry window closed before a fill "
+                     f"(no_trigger; swept at {ts:%H:%M})")
+            return
+
+        # ---- resolve the resting STOP-ENTRY (bar 3 .. 09:45, USER 2026-09-02) ----
         if (not st.get("open") and k >= self.cfg.get("trigger_bar", 2)
                 and k * _w < _dead):
             lvl, lng = st["entry_level"], st["side"] == "long"
@@ -438,16 +655,30 @@ class TightFlagTrader:
                 px = o if o >= lvl else (lvl if h >= lvl else None)
             else:
                 px = o if o <= lvl else (lvl if l <= lvl else None)
-            if px is None:
-                if (k + 1) * _w >= _dead:              # that was the last eligible bucket
-                    self.done[sym] = True
-                    self.state.pop(sym, None)
-                    self.cancel_my_stop(sym)           # pull the unfilled entry order
-                    self.say(f"  · {sym} no trade — never reached ${lvl:.2f} by 09:45 (no_trigger)")
-                return                                 # else: keep resting into the next bar
-            self._open_trade(sym, st, px, ts)
-            if st.get("open"):
-                st["fill_k"] = k       # same-bar stop-outs price at the stop level
+            if self.a.arm:
+                # ARMED TRUTH (2026-09-09): a bar touching the level is NOT an entry —
+                # only the broker's fill is (_on_entry_fill). Bars only decide when the
+                # unfilled resting order dies.
+                if not st.get("open"):
+                    if (k + 1) * _w >= _dead:          # that was the last eligible bucket
+                        self.done[sym] = True
+                        self.state.pop(sym, None)
+                        self.cancel_my_entry(sym)      # pull the unfilled entry order
+                        why2 = ("bars touched the level but the order never filled"
+                                if px is not None else f"never reached ${lvl:.2f}")
+                        self.say(f"  · {sym} no trade — {why2} by 09:45 (no_trigger)")
+                    return
+                # broker filled -> fall through and manage the REAL position
+            else:
+                if px is None:
+                    if (k + 1) * _w >= _dead:          # that was the last eligible bucket
+                        self.done[sym] = True
+                        self.state.pop(sym, None)
+                        self.say(f"  · {sym} no trade — never reached ${lvl:.2f} by 09:45 (no_trigger)")
+                    return                             # else: keep resting into the next bar
+                self._open_trade(sym, st, px, ts)
+                if st.get("open"):
+                    st["fill_k"] = k   # same-bar stop-outs price at the stop level
             # fall through: this same bar 3 is also managed (stop-first convention)
 
         if not st.get("open"):
@@ -457,20 +688,26 @@ class TightFlagTrader:
         if self.check_external_close(sym, st, ts, c):
             return
         if not self.assert_protected(sym, st, ts):
-            self._book(sym, st, c, "EXT", ts)
-            return
+            if not self.a.arm:
+                self._book(sym, st, c, "EXT", ts)
+            return          # armed: the market close it sent (or its fallback) books
         lng = st["side"] == "long"
         R = st["R"]
         fav = ((h - st["entry"]) if lng else (st["entry"] - l)) / R
         st["mfe"] = max(st.get("mfe", 0.0), fav)
         hit = (l <= st["stop"]) if lng else (h >= st["stop"])
         if hit:
-            if st.get("fill_k") == k:
-                px = st["stop"]        # same-bar stop-out: the open predates our fill
+            if self.a.arm:
+                # ARMED TRUTH: a bar touching the stop is not an exit — the broker's
+                # stop fill books it (_on_exit_fill), at the real price and time.
+                pass
             else:
-                px = min(st["stop"], o) if lng else max(st["stop"], o)
-            self._book(sym, st, px, "STOP", ts)
-            return
+                if st.get("fill_k") == k:
+                    px = st["stop"]    # same-bar stop-out: the open predates our fill
+                else:
+                    px = min(st["stop"], o) if lng else max(st["stop"], o)
+                self._book(sym, st, px, "STOP", ts)
+                return
         barnum = k + 1
         if not st["fly"] and barnum <= self.cfg["fly_by_bar"] and fav >= self.cfg["fly_trigger_R"]:
             st["fly"] = True
@@ -496,7 +733,11 @@ class TightFlagTrader:
                 if self.a.arm:
                     self.move_stop(sym, new)
         if ts.time() >= EOD_BAR_START:                 # the EOD exit bar just closed -> flat
-            self._book(sym, st, c, "EOD", ts)
+            if self.a.arm:
+                if not st.get("closing"):
+                    self.close_my_position(sym, st, "EOD 15:49")   # its FILL books the exit
+            else:
+                self._book(sym, st, c, "EOD", ts)
 
     def _evaluate(self, sym):
         B = self.bars.get(sym, {})
@@ -519,6 +760,24 @@ class TightFlagTrader:
             self.say(f"  · {sym} no trade — long_below_prev_close "
                      f"(bar1 high ${setup['h1']:.2f} < prev close ${pc:.2f})")
             return
+        if self.a.arm:
+            # LATE-ARM GUARD (2026-09-09): placing a stop-entry for a window that is
+            # already over is a DIFFERENT trade — at 12:07 a morning buy-stop is just
+            # a marketable order (TER: instant fill @ 380.04, +204c of slip, 68% of R
+            # gone before the trade began). A late start forfeits the day's entry.
+            dead = (datetime.combine(self.day, dtime(9, 30))
+                    + timedelta(minutes=self.cfg.get("entry_deadline_min", 15)))
+            now = self._now()
+            if now >= dead:
+                self.done[sym] = True
+                self.say(f"  ⏰ {sym} setup found, but its entry window ended {dead:%H:%M} "
+                         f"and it is now {now:%H:%M} — LATE START: no order placed, no row")
+                return
+            if len(self.state) >= self.a.max_positions:
+                self.done[sym] = True
+                self.say(f"  · {sym} skipped — {self.a.max_positions} setup(s) already "
+                         f"working (armed orders are real the moment they rest)")
+                return
         lvl = setup["entry_level"]
         stop0 = setup["l2"] if setup["side"] == "long" else setup["h2"]
         self.state[sym] = dict(side=setup["side"], setup=setup, armed_at=b1["ts"], open=False,
@@ -532,8 +791,13 @@ class TightFlagTrader:
             self.place_stop_entry(sym, setup["side"], lvl, stop0)
 
     def _open_trade(self, sym, st, price, ts):
-        """The resting stop-entry filled during bar 3 at `price` (the level, or bar 3's
-        open if the market gapped through the order)."""
+        """MODELED fill (shadow/replay/cache): the resting stop-entry filled at `price`
+        (the level, or the bucket open if the market gapped through the order).
+        ARMED runs never come here — the broker's fill opens the trade (_on_entry_fill)."""
+        if self.a.arm:
+            self.say(f"  🐞 {sym} _open_trade called while ARMED — refusing the modeled "
+                     f"fill (broker fills are the only armed truth)")
+            return
         setup = st["setup"]
         lng = st["side"] == "long"
         stop = setup["l2"] if lng else setup["h2"]
@@ -578,23 +842,11 @@ class TightFlagTrader:
                                 trail=st["trail"], mfe=st.get("mfe", 0.0),
                                 late=st.get("late", 0)))
         if self.a.arm:
-            if kind == "EOD":
-                self.close_my_position(sym, st, "EOD 15:49")
-            else:
-                # BLOCKER FIX 2026-07-28: a STOP/EXT booking used to just cancel and walk
-                # away, assuming the broker's stop had filled. If it had been rejected or
-                # sat Inactive, the position was still live, unprotected and unmanaged.
-                # Verify flat; if not, close what is actually there.
-                net = self.broker_qty(sym)
-                ours_long = st["side"] == "long"
-                still_open = (net > 0) if ours_long else (net < 0)
-                if still_open:
-                    self.say(f"  🚨 {sym} booked {kind} but the broker still shows {net:+.0f} — "
-                             f"the protective stop did NOT fill. Closing at market.")
-                    st["qty"] = int(min(st.get("qty") or 0, abs(net))) or int(abs(net))
-                    self.close_my_position(sym, st, f"{kind} not filled")
-                else:
-                    self.cancel_my_stop(sym)
+            # ARMED TRUTH (2026-09-09): armed bookings are now driven BY broker fills
+            # (_on_exit_fill / close_my_position), so there is nothing to verify here —
+            # just guarantee a booked trade leaves NOTHING working at the broker.
+            self.cancel_my_stop(sym)
+            self.cancel_my_entry(sym)
         st["open"] = False
         # BUG FIX 2026-09-04: one setup, one trade. Leaving the symbol in self.state
         # after booking kept the entry-resolution branch armed — a re-touch of the
@@ -603,11 +855,53 @@ class TightFlagTrader:
         # DID trade (TGTX 09-03).
         self.done[sym] = True
         self.state.pop(sym, None)
-        self.done[sym] = True
+        if self.a.arm:
+            # AUDIT FIX 2026-09-10: bookings used to sit in memory until eod()/Ctrl-C,
+            # so a crash (or a Gateway drop) between a 10:02 stop-out and 15:49 lost
+            # the day's real trades entirely. write_ledger upserts per symbol-session,
+            # so calling it per booking is idempotent — just durable.
+            self.write_ledger()
 
     # ---- EOD -------------------------------------------------------------
     def eod(self, ts=None):
         ts = ts or datetime.now(ET).replace(tzinfo=None)
+        if self.a.arm:
+            open_syms = [s2 for s2, st2 in list(self.state.items()) if st2.get("open")]
+            for s2 in open_syms:
+                if not self.state[s2].get("closing"):
+                    self.close_my_position(s2, self.state[s2], "EOD flatten")
+            if open_syms:
+                try:
+                    self.ib.sleep(5)               # let the close fills arrive and book
+                except Exception:
+                    pass
+            for s2 in open_syms:                   # never leave the ledger silent
+                st2 = self.state.get(s2)
+                if not (st2 and st2.get("open")):
+                    continue
+                # AUDIT FIX 2026-09-10: only a broker that shows us FLAT may be booked.
+                # ib.sleep() above is a no-op when eod() is reached from inside an
+                # event callback, so "the fill has not arrived" is often just "we did
+                # not actually wait" — booking there would re-invent the very fiction
+                # this redesign removes. If the shares are still there, say so and
+                # leave the trade open; the main loop's 15:52 check calls eod() again.
+                net2 = self.broker_qty(s2)
+                if (net2 > 0) if st2["side"] == "long" else (net2 < 0):
+                    if not st2.get("eod_shouted"):
+                        st2["eod_shouted"] = True
+                        self.say(f"  🚨 {s2} STILL OPEN at the broker after the EOD close "
+                                 f"({net2:+.0f}) — NOT booking a guess. Leaving the trade "
+                                 f"open for the next flatten attempt; if it survives the "
+                                 f"session, FLATTEN IT MANUALLY AT IBKR.")
+                    continue
+                B2 = self.bars.get(s2, {})
+                px2 = (B2[self.order5[s2][-1]]["c"] if self.order5.get(s2)
+                       else st2.get("entry", 0.0))
+                self.say(f"  🚨 {s2} broker shows flat but the close fill never reached "
+                         f"us — booking EXT at last ${px2:.2f}; CHECK IBKR for the real fill")
+                self._book(s2, st2, px2, "EXT", ts)
+            self.write_ledger()
+            return
         for sym, st in list(self.state.items()):
             if st.get("open"):
                 # fallback path — reached when no 15:45 bar exists (half-day sessions
@@ -933,6 +1227,48 @@ def main():
     if not syms:
         sys.exit("✗ none of the requested tickers could be resolved — nothing to do.")
 
+    if a.arm and not a.replay:
+        # STARTUP RECONCILIATION (2026-09-09): a previous run's TF- orders are
+        # landmines (KLAC: an orphaned 228-share buy-stop). AUDIT FIX 2026-09-10:
+        # cancel ONLY the legs that are safe to cancel. An unfilled ENTRY (-E) or a
+        # stranded close (-C) is a landmine; a PROTECTIVE stop (-P) is the only thing
+        # standing between a surviving position and an unlimited loss — shutdown_report
+        # deliberately leaves those working, so sweeping them was un-doing our own
+        # safety. Orders with no leg tag predate this fix and cannot be classified
+        # (a short's entry is a SELL STP exactly like a long's protective stop), so
+        # we refuse to arm rather than guess with real shares.
+        try:
+            stale = [t for t in ib.openTrades()
+                     if str(getattr(t.order, "orderRef", "") or "").startswith(f"{REF_PREFIX}-")]
+        except Exception:
+            stale = []
+        unknown = [t for t in stale
+                   if not str(t.order.orderRef).rsplit("-", 1)[-1] in ("E", "P", "C")]
+        if unknown:
+            for t in unknown:
+                print(f"  ⛔ working order {t.order.orderRef} ({t.order.action} "
+                      f"{t.order.orderType} {t.order.totalQuantity:g} "
+                      f"{t.contract.symbol}) carries no leg tag — it could be an unfilled "
+                      f"entry OR a protective stop holding a live position.")
+            sys.exit("✗ refusing to arm with unclassifiable TF- orders working. Cancel or "
+                     "resolve them at IBKR (check positions first), then start again.")
+        for t in stale:
+            leg = str(t.order.orderRef).rsplit("-", 1)[-1]
+            if leg == "P":
+                print(f"  🛡️ LEAVING a protective stop working: {t.order.action} "
+                      f"{t.order.totalQuantity:g} {t.contract.symbol} "
+                      f"({t.order.orderRef}) — it is guarding a position from an earlier "
+                      f"run. This bot will NOT manage that trade; flatten it at IBKR.")
+                continue
+            print(f"  🧹 cancelling a working {t.order.action} {t.order.orderType} "
+                  f"{t.order.totalQuantity:g} {t.contract.symbol} from a previous run "
+                  f"({t.order.orderRef}) — if IBKR shows a matching POSITION, flatten "
+                  f"it manually before trusting today's run")
+            try:
+                ib.cancelOrder(t.order)
+            except Exception:
+                pass
+
     def sink_for(sym):
         def sink(k, ts, o, h, l, c, v, n):
             bot.on_5min(sym, k, ts, o, h, l, c, v, n)
@@ -1010,6 +1346,8 @@ def main():
                 bot.eod(now)
     except KeyboardInterrupt:
         print("\n  interrupted — writing ledger")
+        if a.arm:
+            bot.shutdown_report()
         bot.write_ledger()
     finally:
         ib.disconnect()
