@@ -172,7 +172,21 @@ class TightFlagTrader:
         self.session_tally: list = []
         self._last_size_note = ""
         self.day = None
-        self.log_path = f"logs/tightflag_{datetime.now(ET):%Y-%m-%d}.log"
+        self.log_path = self._log_path_for(datetime.now(ET).date())
+
+    def _log_path_for(self, day) -> str:
+        """Which log file a session narrates into.
+
+        BUG FIX 2026-09-10: an offline --cache-day regression appended its narration
+        to the CURRENT day's log — roll_day short-circuits when the preset day already
+        matches, so the path chosen at construction (today) was never repointed, and a
+        09-03 replay wrote 09-03 setups and fills into the 09-10 session record. Give
+        cache regressions their own file instead: replayed output never shares a file
+        with a real session's record (USER 2026-09-01), and pointing it at the
+        REPLAYED day's log would be no better — that would rewrite history."""
+        if self.RUN_MODE == "cache":
+            return f"logs/cachereplay_{day:%Y-%m-%d}.log"
+        return f"logs/tightflag_{day:%Y-%m-%d}.log"
 
     # ---- narration -------------------------------------------------------
     def say(self, line):
@@ -612,7 +626,7 @@ class TightFlagTrader:
         self.my_orders.clear()
         for agg in self.aggs.values():
             agg.k = None
-        self.log_path = f"logs/tightflag_{day:%Y-%m-%d}.log"
+        self.log_path = self._log_path_for(day)
 
     def on_5min(self, sym, k, ts, o, h, l, c, v, cov):
         """One CLOSED clock-aligned 5-min bar. k = window index (0 = 09:30)."""
@@ -1060,6 +1074,7 @@ def cache_replay(a, syms):
         TightFlagTrader.RUN_MODE = "cache"     # offline regression, not a real run
         bot = TightFlagTrader(_NoIB(), None, None, a)
         bot.day = datetime.fromisoformat(a.cache_day).date()
+        bot.log_path = bot._log_path_for(bot.day)      # not today's session record
         # previous session's close for the long gate — the prior cached day, from
         # the SAME dataset the bars came from (stale cache/ibkr5 path fixed 2026-09-04)
         cdir = os.path.dirname(p)

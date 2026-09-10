@@ -643,6 +643,40 @@ def t_armed_eod_closes_at_market_and_books_its_fill():
     assert abs(bot.closed[0]["exit"] - 10.89) < 1e-9, "EOD must book the real close fill"
 
 
+def t_cache_replay_has_its_own_log():
+    """BUG FIX 2026-09-10: a --cache-day regression must NOT narrate into the current
+    day's session log (it appended 09-03 setups and fills to the 09-10 record), and
+    must not rewrite the replayed day's log either."""
+    import live_trader_tightflag as L
+    from datetime import date as _D
+
+    class A:
+        symbols = []; watchlist = "auto"; arm = False; risk = 0.0025; base = 100000.0
+        max_positions = 2; max_notional = 1.0; delayed = False; replay = False
+
+    class NoIB:
+        def positions(self): return []
+        def accountValues(self): return []
+
+    saved = L.TightFlagTrader.RUN_MODE
+    try:
+        L.TightFlagTrader.RUN_MODE = "cache"
+        bot = L.TightFlagTrader(NoIB(), None, None, A())
+        day = _D(2026, 9, 3)
+        assert bot._log_path_for(day) == "logs/cachereplay_2026-09-03.log", bot.log_path
+        assert "tightflag_" not in bot.log_path, \
+            f"a cache run must never open a session log ({bot.log_path})"
+        bot.roll_day(day)                       # the path must follow the replayed day
+        assert bot.log_path == "logs/cachereplay_2026-09-03.log", bot.log_path
+
+        L.TightFlagTrader.RUN_MODE = "shadow"
+        live = L.TightFlagTrader(NoIB(), None, None, A())
+        live.roll_day(day)
+        assert live.log_path == "logs/tightflag_2026-09-03.log", live.log_path
+    finally:
+        L.TightFlagTrader.RUN_MODE = saved
+
+
 import os
 if __name__ == "__main__":
     print("tight-flag rule tests (1-min pivot rules)\n" + "=" * 46)
@@ -667,6 +701,7 @@ if __name__ == "__main__":
     check("ARMED: never duplicates an in-flight close", t_armed_never_duplicates_an_in_flight_close)
     check("ARMED: missing 09:44 bar still cancels the entry", t_armed_missing_0944_bar_still_cancels_the_entry)
     check("ARMED: order legs are distinguishable (E/P/C)", t_order_legs_are_distinguishable)
+    check("cache replays get their own log file", t_cache_replay_has_its_own_log)
     print("=" * 46)
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
     raise SystemExit(1 if FAIL else 0)
