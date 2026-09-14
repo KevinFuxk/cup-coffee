@@ -70,8 +70,12 @@ from zoneinfo import ZoneInfo
 
 from pattern_detector_tightflag import (CONFIG, cfg_width, detect, prev_close_gate, r_unit_for,
                                         entry_fill)
-from live_trader_ibkr import read_watchlist   # shared TradingView-export discovery
-                                              # (import only — cup files stay read-only)
+from live_trader_ibkr import read_watchlist, universe_verdict
+                                              # shared TradingView-export discovery and THE
+                                              # universe screen (import only — cup files stay
+                                              # read-only). Importing the screen rather than
+                                              # re-implementing it is the point: the live
+                                              # session and the official record cannot drift.
 from data_layer import Bars
 
 ET = ZoneInfo("America/New_York")
@@ -168,6 +172,9 @@ class TightFlagTrader:
         self.state: dict = {}                        # sym -> live trade state
         self.done: dict = {}                         # sym -> True once the day is finished
         self.my_orders: dict = {}                    # ref -> {"stop": Trade, "entry": Trade}
+        self.details: dict = {}                      # sym -> IBKR contractDetails (universe screen)
+        self.unscreened: set = set()                 # passed the pre-open screen; the $15 floor
+                                                     # is judged on THIS session's open (bar 0)
         self.closed: list = []
         self.session_tally: list = []
         self._last_size_note = ""
@@ -760,6 +767,19 @@ class TightFlagTrader:
             self.say(f"  · {sym} no trade — missing an opening bar")
             return
         b0, b1 = B[0], B[1]
+        if sym in self.unscreened:
+            # USER 2026-09-14: the live bot screened only ETFs, so it would have traded
+            # names the official record excludes — on 09-14 that was FANG (commodity)
+            # and BMGL (sub-$15), a -2.00R pair that would never have reached the
+            # ledger. The pre-open screen cannot judge price (the open is unknown
+            # then), so the full verdict is re-run here on bar 0's open, which IS the
+            # session open the record uses.
+            self.unscreened.discard(sym)
+            why_u = universe_verdict(sym, b0["o"], self.details.get(sym))
+            if why_u:
+                self.done[sym] = True
+                self.say(f"  🚫 {sym} not in the universe — {why_u}")
+                return
         five = Bars(sym, self.day, CONFIG["timeframe"], [b0["ts"], b1["ts"]],
                     [b0["o"], b1["o"]], [b0["h"], b1["h"]], [b0["l"], b1["l"]],
                     [b0["c"], b1["c"]], [b0["v"], b1["v"]], True)
@@ -1219,25 +1239,28 @@ def main():
               f"(delisted, renamed, or not available on this account)")
         syms = [s for s in syms if s in bot.contracts]
 
-    # USER 2026-09-03 universe policy: SPY and QQQ are the only tradable ETFs — every
-    # other ETF/ETN/fund is dropped here, mirroring the cup screen's stockType rule so
-    # the live session and the official record agree on the population.
-    ETF_ALLOWED = {"SPY", "QQQ"}
-    not_common = []
+    # THE UNIVERSE SCREEN (USER 2026-09-14) — the SAME live_trader_ibkr.universe_verdict
+    # the official record is screened with: common stock only (SPY/QQQ are the whitelisted
+    # ETFs), price >= $15, and no commodity-related names. This used to be a hand-rolled
+    # ETF-only check, which let the live bot trade six names on 09-14 that the record
+    # excludes. Price cannot be judged before the open, so only the classification rules
+    # run here; the $15 floor is applied to bar 0's open in _evaluate (self.unscreened).
+    dropped = []
     for s2 in list(bot.contracts):
-        if s2 in ETF_ALLOWED:
-            continue
         try:
             cds = ib.reqContractDetails(bot.contracts[s2])
-            st2 = (getattr(cds[0], "stockType", "") or "").upper() if cds else ""
+            bot.details[s2] = cds[0] if cds else None
         except Exception:
-            st2 = ""
-        if st2 and st2 not in ("COMMON", "ADR"):
-            not_common.append((s2, st2))
+            bot.details[s2] = None
+        why2 = universe_verdict(s2, None, bot.details[s2])
+        if why2:
+            dropped.append((s2, why2))
             del bot.contracts[s2]
-    if not_common:
-        print("  🚫 not common stock (only SPY/QQQ may be ETFs): "
-              + ", ".join(f"{a_}({b_})" for a_, b_ in not_common))
+        else:
+            bot.unscreened.add(s2)                 # the $15 rule still owes a verdict
+    if dropped:
+        print("  🚫 dropped by the universe screen: "
+              + ", ".join(f"{a_} ({b_})" for a_, b_ in dropped))
         syms = [s for s in syms if s in bot.contracts]
     if not syms:
         sys.exit("✗ none of the requested tickers could be resolved — nothing to do.")

@@ -677,6 +677,69 @@ def t_cache_replay_has_its_own_log():
         L.TightFlagTrader.RUN_MODE = saved
 
 
+def t_live_universe_screen_matches_the_record():
+    """USER 2026-09-14: the live bot screened only ETFs, so it would have traded names
+    the official record excludes — on 09-14 that was FANG (commodity) and BMGL
+    (sub-$15), a -2.00R pair that could never have reached the ledger. The live path
+    now runs the record's OWN universe_verdict, with the $15 floor judged on bar 0's
+    open (the same price the record judges)."""
+    import live_trader_tightflag as L
+
+    class A:
+        symbols = []; watchlist = "auto"; arm = False; risk = 0.0025; base = 100000.0
+        max_positions = 2; max_notional = 1.0; delayed = False; replay = False
+
+    class NoIB:
+        def positions(self): return []
+        def accountValues(self): return []
+
+    def run(bars, screened, details, prev):
+        bot = L.TightFlagTrader(NoIB(), None, None, A())
+        bot.say = lambda line: None         # NEVER write test narration into logs/
+        bot.prev_close["TST"] = prev
+        if screened:
+            bot.unscreened.add("TST")
+        bot.details["TST"] = details
+        for i in range(len(bars.ts)):
+            kk = (bars.ts[i].hour * 60 + bars.ts[i].minute - 570) // L.Clock5.WIDTH
+            bot.on_5min("TST", kk, bars.ts[i], bars.o[i], bars.h[i],
+                        bars.l[i], bars.c[i], bars.v[i], 1)
+        return bot
+
+    def cheap():                            # opens at 10.00 — under the $15 floor
+        b = mk(B1, B2)
+        pad_to(b, 9 * 60 + 32, 10.32, 10.41, 10.30, 10.39)
+        return b
+
+    def rich():                             # same shape, opens at 20.00 — clears it
+        b = mk((20.00, 20.80, 20.00, 20.76), (20.72, 20.72, 20.40, 20.60))
+        pad_to(b, 9 * 60 + 32, 20.64, 20.82, 20.60, 20.78)
+        return b
+
+    # 1. a sub-$15 OPEN is dropped, exactly as the record drops it
+    bot = run(cheap(), True, None, 9.0)
+    assert bot.done.get("TST") and "TST" not in bot.state and not bot.closed, \
+        "a sub-$15 open must never reach the strategy"
+
+    # 2. a commodity name is dropped even though its price clears the floor
+    comm = _NS(stockType="COMMON", industry="Basic Materials", category="Oil&Gas")
+    bot = run(rich(), True, comm, 18.0)
+    assert bot.done.get("TST") and "TST" not in bot.state and not bot.closed, \
+        "a commodity name must never reach the strategy"
+
+    # 3. a clean name still trades — the screen must not swallow the universe
+    ok = _NS(stockType="COMMON", industry="Technology", category="Software")
+    bot = run(rich(), True, ok, 18.0)
+    assert bot.state.get("TST", {}).get("open") or bot.closed, \
+        "a qualifying name must still trade"
+
+    # 4. an unscreened run (offline --cache-day regression) is untouched, so the
+    #    frozen research record cannot move under us
+    bot = run(cheap(), False, None, 9.0)
+    assert bot.state.get("TST", {}).get("open") or bot.closed, \
+        "cache regressions must stay byte-identical (no screen)"
+
+
 import os
 if __name__ == "__main__":
     print("tight-flag rule tests (1-min pivot rules)\n" + "=" * 46)
@@ -702,6 +765,7 @@ if __name__ == "__main__":
     check("ARMED: missing 09:44 bar still cancels the entry", t_armed_missing_0944_bar_still_cancels_the_entry)
     check("ARMED: order legs are distinguishable (E/P/C)", t_order_legs_are_distinguishable)
     check("cache replays get their own log file", t_cache_replay_has_its_own_log)
+    check("live universe screen matches the record", t_live_universe_screen_matches_the_record)
     print("=" * 46)
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
     raise SystemExit(1 if FAIL else 0)
