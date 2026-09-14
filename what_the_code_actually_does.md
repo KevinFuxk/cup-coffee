@@ -387,6 +387,7 @@ that project's own convention) — do not mix them into cup-coffee work.*
 | `live_trader_ibkr.py` | the IBKR paper order robot: watchlist → stream → pre-armed brackets → EOD flatten; `--replay` writes the ledger |
 | `explain_day.py` | "why didn't we trade X?" — every cup candidate and the exact gate that rejected it, with near-misses |
 | `replay_record.py` | the one-command evening ritual: two-variant replay → `replay_trades.csv` + `.html` → explain_day |
+| `flatten_leftovers.py` | pre-open hygiene: closes positions a previous session left behind (DRY RUN by default, `--execute` to place), so a day's record contains only that day's trading; skips anything already traded today; appends `data/cleanup_log.csv` |
 | `splits.py` | Develop/Validate/Lockbox discipline for SPY/QQQ with code-enforced, logged access budgets |
 | `app.py` | main Streamlit research dashboard (piles, enrichment panels, head-to-heads, trade charts) |
 | `app_trades.py` | small companion viewer: cost sliders, MFE histogram, cumulative R, trade pictures — ⚠️ defaults to the OLD fixed-rim pile unless `PILE`/`TABLE`/`RP` env vars point elsewhere |

@@ -611,6 +611,22 @@ def test_guard_protects_own_book_only_and_counts_only_live_children():
     assert cancelled[-1] == ref and any("orphan" in l for l in said)
 
 
+def test_leftover_flatten_rules():
+    """flatten_leftovers.py decides what yesterday left behind. The rule that makes it
+    safe to run at ANY hour: a symbol with a fill today is live trading, never a leftover."""
+    from flatten_leftovers import leftovers
+    pos = {"TER": 81, "MU": -250, "OXM": 666, "DUOL": 0}
+    today = {"OXM"}                                   # OXM is being traded right now
+    plan = {p[0]: p for p in leftovers(pos, today)}
+    assert "DUOL" not in plan, "a zero position is not a position"
+    assert plan["TER"][1:] == (81, "SELL", ""), plan["TER"]
+    assert plan["MU"][1:] == (-250, "BUY", ""), "a SHORT is closed by buying"
+    assert "traded TODAY" in plan["OXM"][3], "today's live position must never be closed"
+    # --force clears the guard; --exclude protects a name outright
+    assert leftovers(pos, set())[2][3] == "", "with --force every open position is a leftover"
+    assert "excluded" in {p[0]: p for p in leftovers(pos, today, exclude={"TER"})}["TER"][3]
+
+
 # --------------------------------------------------------------------------- runner
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
