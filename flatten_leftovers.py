@@ -15,6 +15,12 @@ This closes what yesterday left behind, so the day's record is only the day's tr
 
 SAFETY, all learned the hard way:
   * DRY RUN by default. Nothing is placed until you type --execute.
+  * NEVER places a close that is already working. Run --execute twice (2026-09-15: the
+    user did, 52 seconds apart) and the naive version rests TWO sell orders against ONE
+    position — both fill at the open and you are SHORT. Working closes are counted first
+    (via reqAllOpenOrders, because ib.openTrades() is client-id scoped and cannot see a
+    previous run's orders), only the shortfall is placed, and an OVERSIZED total is
+    reported — --cancel-duplicates trims it back to the position.
   * A symbol with ANY execution today is NOT a leftover and is skipped (--force to
     override). Run this at 11:00 by accident and it will refuse to touch live trades.
   * Closes route via SMART. ib.positions() hands back the LISTING exchange
@@ -37,6 +43,7 @@ import argparse
 import csv
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -68,6 +75,26 @@ def leftovers(positions: dict, traded_today: set, exclude=()) -> list[tuple]:
     return out
 
 
+def working_closes(ib, sym: str, action: str):
+    """(shares already working to close `sym`, those orders). Uses reqAllOpenOrders:
+    ib.openTrades() is CLIENT-ID SCOPED, so a fresh run cannot otherwise see the orders
+    a previous run left resting — which is exactly how a double --execute goes unnoticed."""
+    try:
+        ib.reqAllOpenOrders()
+        ib.sleep(1)
+    except Exception:
+        pass
+    live, n = [], 0
+    for t in ib.openTrades():
+        if t.contract.symbol != sym or t.order.action != action:
+            continue
+        if t.orderStatus.status not in ("PreSubmitted", "Submitted", "PendingSubmit"):
+            continue
+        live.append(t)
+        n += int(t.order.totalQuantity - (t.orderStatus.filled or 0))
+    return n, live
+
+
 def record(rows: list[dict]) -> None:
     """Append this run to data/cleanup_log.csv — never overwrite; this is money."""
     cols = ["time", "symbol", "qty", "action", "status", "avg_fill", "ref", "note"]
@@ -93,6 +120,8 @@ def main() -> None:
                     help="close even symbols that already traded today (DANGEROUS mid-session)")
     ap.add_argument("--cancel-orders", action="store_true",
                     help="also cancel any resting order on a leftover symbol")
+    ap.add_argument("--cancel-duplicates", action="store_true",
+                    help="cancel working closes that EXCEED the position (fixes a double --execute)")
     ap.add_argument("--i-understand-live", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
 
@@ -176,6 +205,37 @@ def main() -> None:
     ref = f"cleanup-{today}"
     placed, rows = [], []
     for sym, qty, action in doomed:
+        # How many shares are ALREADY working to close this position? A second --execute
+        # must add nothing (2026-09-15: two SELL 81 rested against one 81-share TER long).
+        rest, orders = working_closes(ib, sym, action)
+        need = abs(qty) - rest
+        if rest > abs(qty):
+            extra = rest - abs(qty)
+            print(f"  🚨 {sym}: {rest} sh of closing orders already working against a "
+                  f"{abs(qty)} sh position — {extra} sh OVERSIZED. Filling them all makes you SHORT.")
+            if a.cancel_duplicates:
+                for t in orders:
+                    if rest <= abs(qty):
+                        break
+                    try:
+                        ib.cancelOrder(t.order)
+                        rest -= int(t.order.totalQuantity - (t.orderStatus.filled or 0))
+                        print(f"     🗑️ cancelled duplicate {t.order.action} "
+                              f"{t.order.totalQuantity:.0f} {sym} ({t.order.orderRef or 'no ref'})")
+                    except Exception as e:
+                        print(f"     ⚠️ cancel failed: {e}")
+                rows.append({"time": f"{now:%Y-%m-%d %H:%M:%S}", "symbol": sym, "qty": qty,
+                             "action": action, "status": "DUPLICATES CANCELLED", "ref": ref,
+                             "note": f"trimmed to {rest} sh working"})
+            else:
+                print(f"     re-run with --cancel-duplicates to trim it back to {abs(qty)} sh")
+            continue
+        if need <= 0:
+            print(f"  ↩️ {sym}: {rest} sh already working to close — placing nothing")
+            rows.append({"time": f"{now:%Y-%m-%d %H:%M:%S}", "symbol": sym, "qty": qty,
+                         "action": action, "status": "ALREADY WORKING", "ref": ref,
+                         "note": f"{rest} sh resting"})
+            continue
         c = Stock(sym, "SMART", "USD")               # SMART, never the listing exchange
         try:
             ib.qualifyContracts(c)
@@ -187,12 +247,13 @@ def main() -> None:
                          "action": action, "status": "NOT PLACED", "ref": ref,
                          "note": f"qualify failed: {e}"})
             continue
-        o = MarketOrder(action, abs(qty))
+        o = MarketOrder(action, need)
         o.orderRef = ref
         o.tif = "DAY"
         tr = ib.placeOrder(c, o)
         placed.append((sym, qty, tr))
-        print(f"  ⛔ {action} {abs(qty)} {sym} placed (ref {ref})")
+        print(f"  ⛔ {action} {need} {sym} placed (ref {ref})"
+              + (f" — {rest} sh were already working" if rest else ""))
 
     ib.sleep(5)                                      # standalone script: a blocking sleep is fine here
     print()
